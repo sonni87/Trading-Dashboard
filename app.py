@@ -1,6 +1,6 @@
 """
 Bitget Trading Analytics Dashboard
-Correctly matches opens with closes by time correlation
+Correctly matches opens with closes chronologically
 """
 
 import streamlit as st
@@ -51,48 +51,58 @@ class BitgetAnalyzer:
         for symbol in self.df['Futures'].unique():
             symbol_df = self.df[self.df['Futures'] == symbol].sort_values('Date')
             
+            # Collect all opens and closes as dictionaries with scalar values
             opens = []
             closes = []
             
             for _, row in symbol_df.iterrows():
                 txn_type = row['Type']
                 if txn_type in ['open_short', 'open_long']:
-                    opens.append(row)
+                    opens.append({
+                        'date': row['Date'],
+                        'type': txn_type,
+                        'fee': row['Fee'] if pd.notna(row['Fee']) else 0,
+                        'amount': row['Amount'] if pd.notna(row['Amount']) else 0
+                    })
                 elif txn_type in ['close_short', 'close_long']:
-                    closes.append(row)
+                    closes.append({
+                        'date': row['Date'],
+                        'type': txn_type,
+                        'fee': row['Fee'] if pd.notna(row['Fee']) else 0,
+                        'amount': row['Amount'] if pd.notna(row['Amount']) else 0
+                    })
             
-            # Make copies to work with
-            opens_list = opens.copy()
+            # Make a copy of opens to work with (FIFO queue)
+            opens_queue = opens.copy()
             
             # Process each close in chronological order
             for close in closes:
                 # Find the most recent open BEFORE this close
                 matching_open = None
-                for open_txn in reversed(opens_list):
-                    if open_txn['Date'] < close['Date']:
-                        matching_open = open_txn
+                matching_index = -1
+                
+                for i in range(len(opens_queue) - 1, -1, -1):
+                    if opens_queue[i]['date'] < close['date']:
+                        matching_open = opens_queue[i]
+                        matching_index = i
                         break
                 
                 if matching_open:
-                    # Calculate P&L
-                    fee_credit = abs(matching_open['Fee']) if pd.notna(matching_open['Fee']) else 0
-                    pnl = close['Amount'] if pd.notna(close['Amount']) else 0
-                    fee_paid = close['Fee'] if pd.notna(close['Fee']) else 0
+                    fee_credit = abs(matching_open['fee']) if pd.notna(matching_open['fee']) else 0
+                    pnl = close['amount'] if pd.notna(close['amount']) else 0
+                    fee_paid = close['fee'] if pd.notna(close['fee']) else 0
                     
                     net_pnl = pnl - fee_paid + fee_credit
                     is_win = net_pnl > 0
                     
-                    holding_hours = (close['Date'] - matching_open['Date']).total_seconds() / 3600
-                    
-                    # Calculate approximate prices (if needed)
-                    # For display purposes only
+                    holding_hours = (close['date'] - matching_open['date']).total_seconds() / 3600
                     
                     self.trades.append({
                         'symbol': symbol,
-                        'open_date': matching_open['Date'],
-                        'close_date': close['Date'],
-                        'type': matching_open['Type'],
-                        'close_type': close['Type'],
+                        'open_date': matching_open['date'],
+                        'close_date': close['date'],
+                        'type': matching_open['type'],
+                        'close_type': close['type'],
                         'pnl': pnl,
                         'fee_paid': fee_paid,
                         'fee_credit': fee_credit,
@@ -102,10 +112,9 @@ class BitgetAnalyzer:
                         'is_liquidation': False
                     })
                     
-                    # Remove matched open so it's not reused
-                    opens_list.remove(matching_open)
+                    opens_queue.pop(matching_index)
             
-            # Handle liquidations separately
+            # Handle liquidations
             liquidation_rows = symbol_df[symbol_df['Type'].str.contains('burst_close', na=False)]
             for _, row in liquidation_rows.iterrows():
                 pnl = row['Amount'] if pd.notna(row['Amount']) else 0
@@ -126,7 +135,6 @@ class BitgetAnalyzer:
                     'is_liquidation': True
                 })
         
-        # Sort all trades by close date
         self.trades.sort(key=lambda x: x['close_date'])
     
     def get_summary_stats(self):
@@ -241,22 +249,20 @@ class BitgetAnalyzer:
 def main():
     st.title("📊 Bitget Trading Analytics Dashboard")
     st.markdown("### Analyze your USDT-M/USDC-M Futures trading performance")
-    st.markdown("**📌 Trades are matched chronologically (each close with the most recent open)**")
     
     with st.sidebar:
         st.header("📁 Data Source")
         uploaded_file = st.file_uploader(
             "Upload Bitget CSV Export",
-            type=['csv'],
-            help="Export your transaction history from Bitget as CSV"
+            type=['csv']
         )
         
         st.markdown("---")
-        st.markdown("### 📖 How It Works")
+        st.markdown("### How It Works")
         st.markdown("""
-        - Each closing trade is matched with the **most recent open** before it
-        - This correctly handles multiple positions on the same symbol
-        - Liquidations are included separately
+        - Each close is matched with the most recent open before it
+        - Works correctly for all symbols
+        - Includes liquidations
         """)
     
     if uploaded_file is None:
@@ -279,7 +285,7 @@ def main():
             st.error(f"Error: {str(e)}")
             return
     
-    # Summary metrics
+    # Summary
     col1, col2, col3, col4 = st.columns(4)
     
     with col1:
@@ -298,7 +304,7 @@ def main():
         st.metric("Liquidations", stats['liquidation_trades'])
         st.metric("Max Drawdown", f"${stats['max_drawdown']:.2f}")
     
-    # Symbol breakdown table
+    # Symbol table
     st.subheader("📊 Performance by Symbol")
     symbol_stats = analyzer.get_symbol_breakdown()
     
@@ -317,7 +323,7 @@ def main():
         
         st.dataframe(symbol_df, use_container_width=True, hide_index=True)
     
-    # All trades table
+    # All trades
     st.subheader("📋 All Trades")
     trades_df = analyzer.get_trades_df()
     
