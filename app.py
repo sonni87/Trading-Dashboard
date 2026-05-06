@@ -1,7 +1,7 @@
 """
 Bitget Trading Analytics Dashboard
 Correctly matches opens with closes chronologically
-INCLUDES funding fees (contract_margin_settle_fee) for ALL trades
+PROPERLY INCLUDES funding fees for ALL trades
 """
 
 import streamlit as st
@@ -9,7 +9,7 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 import plotly.express as px
-from datetime import datetime
+from datetime import datetime, timedelta
 import io
 import base64
 
@@ -43,14 +43,29 @@ class BitgetAnalyzer:
         
         return df
     
-    def get_funding_fees_between_dates(self, symbol, start_date, end_date):
+    def get_funding_fees_between_dates(self, symbol, open_date, close_date):
         """Calculate total funding fees for a position between open and close dates"""
-        funding_fees = self.df[
+        
+        # Get ALL funding fees for this symbol within the position's lifetime
+        funding_df = self.df[
             (self.df['Futures'] == symbol) &
             (self.df['Type'] == 'contract_margin_settle_fee') &
-            (self.df['Date'] >= start_date) &
-            (self.df['Date'] <= end_date)
-        ]['Amount'].sum()
+            (self.df['Date'] >= open_date) &
+            (self.df['Date'] <= close_date)
+        ]
+        
+        funding_fees = funding_df['Amount'].sum()
+        
+        # If no funding fees found, try with a 1-hour buffer (for timezone issues)
+        if pd.isna(funding_fees) or funding_fees == 0:
+            funding_df = self.df[
+                (self.df['Futures'] == symbol) &
+                (self.df['Type'] == 'contract_margin_settle_fee') &
+                (self.df['Date'] >= open_date - pd.Timedelta(hours=1)) &
+                (self.df['Date'] <= close_date + pd.Timedelta(hours=1))
+            ]
+            funding_fees = funding_df['Amount'].sum()
+        
         return funding_fees if pd.notna(funding_fees) else 0
     
     def parse_trades(self):
@@ -62,7 +77,7 @@ class BitgetAnalyzer:
         for symbol in self.df['Futures'].unique():
             symbol_df = self.df[self.df['Futures'] == symbol].sort_values('Date')
             
-            # Collect all opens and closes as dictionaries with scalar values
+            # Collect all opens and closes
             opens = []
             closes = []
             
@@ -97,7 +112,7 @@ class BitgetAnalyzer:
                         break
                 
                 if matching_open:
-                    # Calculate funding fees for this position (for ALL symbols)
+                    # Calculate funding fees for this position
                     funding_fees = self.get_funding_fees_between_dates(
                         symbol, 
                         matching_open['date'], 
@@ -109,7 +124,7 @@ class BitgetAnalyzer:
                     pnl = close['amount'] if pd.notna(close['amount']) else 0
                     fee_paid = close['fee'] if pd.notna(close['fee']) else 0
                     
-                    # Net P&L includes: trading profit/loss - trading fees + opening credit + funding fees
+                    # Net P&L includes everything
                     net_pnl = pnl - fee_paid + fee_credit + funding_fees
                     is_win = net_pnl > 0
                     
@@ -134,7 +149,7 @@ class BitgetAnalyzer:
                     # Remove matched open
                     opens_queue.pop(matching_index)
             
-            # Handle liquidations (burst_close) separately for ALL symbols
+            # Handle liquidations
             liquidation_rows = symbol_df[symbol_df['Type'].str.contains('burst_close', na=False)]
             for _, row in liquidation_rows.iterrows():
                 pnl = row['Amount'] if pd.notna(row['Amount']) else 0
@@ -156,7 +171,6 @@ class BitgetAnalyzer:
                     'is_liquidation': True
                 })
         
-        # Sort all trades by close date
         self.trades.sort(key=lambda x: x['close_date'])
     
     def get_summary_stats(self):
@@ -280,27 +294,23 @@ class BitgetAnalyzer:
 def main():
     st.title("📊 Bitget Trading Analytics Dashboard")
     st.markdown("### Analyze your USDT-M/USDC-M Futures trading performance")
-    st.markdown("**✅ Includes funding fees (contract_margin_settle_fee) for ALL trades**")
+    st.markdown("**✅ Includes funding fees for ALL trades | Correctly matches opens to closes**")
     
     with st.sidebar:
         st.header("📁 Data Source")
         uploaded_file = st.file_uploader(
             "Upload Bitget CSV Export",
-            type=['csv'],
-            help="Export your transaction history from Bitget as CSV"
+            type=['csv']
         )
         
         st.markdown("---")
         st.markdown("### How It Works")
         st.markdown("""
         - Each close is matched with the most recent open before it
-        - **Funding fees are included** in P&L for ALL symbols
+        - **Funding fees are included** in P&L for ALL positions
         - Opening fee credits are applied
         - Liquidations are shown separately
         """)
-        
-        st.markdown("---")
-        st.markdown("Made with ❤️ for Bitget traders")
     
     if uploaded_file is None:
         st.info("👈 Upload your Bitget CSV file to begin")
@@ -317,16 +327,6 @@ def main():
                 return
             
             st.success(f"✅ {len(analyzer.trades)} trades analyzed")
-            
-            # Show fee breakdown
-            with st.expander("💰 Fee Breakdown"):
-                col1, col2, col3 = st.columns(3)
-                with col1:
-                    st.metric("Total Trading Fees", f"${stats.get('total_trading_fees', 0):.2f}")
-                with col2:
-                    st.metric("Total Funding Fees", f"${stats.get('total_funding_fees', 0):.2f}")
-                with col3:
-                    st.metric("Total Opening Credits", f"${stats.get('total_opening_credits', 0):.2f}")
             
         except Exception as e:
             st.error(f"Error: {str(e)}")
@@ -347,71 +347,22 @@ def main():
     with col3:
         pnl_color = "🟢" if stats['total_pnl'] >= 0 else "🔴"
         st.metric("Total Net P&L", f"{pnl_color} ${stats['total_pnl']:.2f}")
-        st.metric("Expectancy", f"${stats['expectancy']:.2f}")
     
     with col4:
         st.metric("Liquidations", stats['liquidation_trades'])
-        st.metric("Max Drawdown", f"${stats['max_drawdown']:.2f}")
+        st.metric("Total Funding Fees", f"${stats['total_funding_fees']:.2f}")
     
-    # Best/Worst Trades
-    if stats['best_trade'] or stats['worst_trade']:
-        col1, col2 = st.columns(2)
-        
+    # Fee breakdown
+    with st.expander("💰 Fee Breakdown"):
+        col1, col2, col3 = st.columns(3)
         with col1:
-            if stats['best_trade']:
-                best = stats['best_trade']
-                badge = "⚠️ LIQUIDATION" if best.get('is_liquidation', False) else "✅ NORMAL"
-                st.info(f"""
-                **🏆 Best Trade**
-                - Symbol: {best['symbol']}
-                - P&L: **${best['net_pnl']:.2f}**
-                - Date: {best['close_date'].strftime('%Y-%m-%d %H:%M')}
-                - Funding Fees: ${best.get('funding_fees', 0):.2f}
-                - {badge}
-                """)
-        
+            st.metric("Trading Fees Paid", f"${stats.get('total_trading_fees', 0):.2f}")
         with col2:
-            if stats['worst_trade']:
-                worst = stats['worst_trade']
-                badge = "⚠️ LIQUIDATION" if worst.get('is_liquidation', False) else "❌ NORMAL"
-                st.error(f"""
-                **💩 Worst Trade**
-                - Symbol: {worst['symbol']}
-                - P&L: **${worst['net_pnl']:.2f}**
-                - Date: {worst['close_date'].strftime('%Y-%m-%d %H:%M')}
-                - Funding Fees: ${worst.get('funding_fees', 0):.2f}
-                - {badge}
-                """)
+            st.metric("Funding Fees Paid", f"${stats.get('total_funding_fees', 0):.2f}")
+        with col3:
+            st.metric("Opening Fee Credits", f"${stats.get('total_opening_credits', 0):.2f}")
     
-    # Cumulative P&L Chart
-    st.subheader("📈 Cumulative P&L Over Time")
-    ts_data = analyzer.get_time_series_data()
-    if not ts_data.empty:
-        fig = go.Figure()
-        
-        fig.add_trace(go.Scatter(
-            x=ts_data['trade_number'],
-            y=ts_data['cumulative_pnl'],
-            mode='lines',
-            name='Equity Curve',
-            line=dict(color='#00ff00', width=2)
-        ))
-        
-        liquidation_points = ts_data[ts_data['is_liquidation'] == 1]
-        if not liquidation_points.empty:
-            fig.add_trace(go.Scatter(
-                x=liquidation_points['trade_number'],
-                y=liquidation_points['cumulative_pnl'],
-                mode='markers',
-                name='Liquidations',
-                marker=dict(color='red', size=10, symbol='x')
-            ))
-        
-        fig.update_layout(height=450, xaxis_title="Trade Number", yaxis_title="Cumulative P&L (USDT)")
-        fig.add_hline(y=0, line_dash="dash", line_color="gray", opacity=0.5)
-        st.plotly_chart(fig, use_container_width=True)
-    
-    # Symbol Breakdown Table
+    # Symbol breakdown
     st.subheader("📊 Performance by Symbol")
     symbol_stats = analyzer.get_symbol_breakdown()
     
@@ -431,7 +382,7 @@ def main():
         
         st.dataframe(symbol_df, use_container_width=True, hide_index=True)
     
-    # All Trades Table
+    # All trades
     st.subheader("📋 All Trades")
     trades_df = analyzer.get_trades_df()
     
@@ -441,32 +392,19 @@ def main():
         display_df['net_pnl'] = display_df['net_pnl'].apply(lambda x: f"${x:.2f}")
         display_df['funding_fees'] = display_df['funding_fees'].apply(lambda x: f"${x:.2f}")
         display_df['is_win'] = display_df['is_win'].apply(lambda x: "✅ Win" if x else "❌ Loss")
-        display_df['is_liquidation'] = display_df['is_liquidation'].apply(lambda x: "⚠️ LIQUIDATION" if x else "Normal")
+        display_df['type'] = display_df['is_liquidation'].apply(lambda x: "⚠️ LIQUIDATION" if x else "Normal")
         display_df['holding_hours'] = display_df['holding_hours'].apply(lambda x: f"{x:.1f}h" if x > 0 else "Instant")
         
         st.dataframe(
-            display_df[['close_date', 'symbol', 'is_liquidation', 'net_pnl', 'funding_fees', 'is_win', 'holding_hours']],
+            display_df[['close_date', 'symbol', 'type', 'net_pnl', 'funding_fees', 'is_win', 'holding_hours']],
             use_container_width=True,
-            hide_index=True,
-            column_config={
-                'close_date': 'Close Date',
-                'symbol': 'Symbol',
-                'is_liquidation': 'Type',
-                'net_pnl': 'Net P&L',
-                'funding_fees': 'Funding Fees',
-                'is_win': 'Result',
-                'holding_hours': 'Duration'
-            }
+            hide_index=True
         )
         
-        # Download button
+        # Download
         csv = trades_df.to_csv(index=False)
         b64 = base64.b64encode(csv.encode()).decode()
         st.markdown(f'<a href="data:file/csv;base64,{b64}" download="bitget_trades.csv">📥 Download CSV</a>', unsafe_allow_html=True)
-        
-        # Risk Warning
-        if stats['liquidation_trades'] > 0:
-            st.warning(f"⚠️ **Risk Alert:** {stats['liquidation_trades']} liquidation(s) detected. Consider reviewing position sizing.")
 
 if __name__ == "__main__":
     main()
