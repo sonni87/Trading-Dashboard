@@ -205,133 +205,39 @@ class BitgetAnalyzer:
         return self.df[(self.df['Futures'] == sym) & (self.df['Type'] == 'contract_margin_settle_fee') & (self.df['Date'] >= od) & (self.df['Date'] <= cd)]['Amount'].sum()
 
     def parse_trades(self):
-        """
-        Build closed Bitget positions from ledger rows.
-
-        This keeps separate open Long/Short buckets per symbol instead of using a
-        single current position. It is more robust when a file contains partial
-        closes, alternating long/short trades, force closes, or multiple market
-        exports merged together.
-        """
         open_t = {'open_short', 'open_long'}
         close_t = {'close_short', 'close_long', 'force_close_long', 'force_close_short'}
-        liquidation_t = {'burst_close_long', 'burst_close_short'}
-
-        valid = self.df[
-            self.df['Futures'].notna()
-            & (self.df['Futures'].astype(str).str.strip() != '')
-            & (self.df['Futures'].astype(str) != 'nan')
-        ].copy()
-
-        if valid.empty:
-            return
-
-        valid['Type'] = valid['Type'].astype(str).str.strip()
-
-        def direction_from_type(t):
-            return 'Long' if 'long' in str(t) else 'Short'
-
+        valid = self.df[self.df['Futures'].notna() & (self.df['Futures'].astype(str).str.strip() != '') & (self.df['Futures'].astype(str) != 'nan')]
         for sym in valid['Futures'].unique():
             sdf = valid[valid['Futures'] == sym].sort_values('Date')
-            if sdf.empty:
-                continue
-
+            if sdf.empty: continue
             market = sdf['Market'].iloc[0] if 'Market' in sdf.columns else '?'
-            current = {'Long': None, 'Short': None}
-            positions = []
-
+            positions, cur = [], None
             for _, r in sdf.iterrows():
-                t = str(r['Type']).strip()
-                direction = direction_from_type(t)
-
+                t = r['Type']
                 if t in open_t:
-                    cur = current[direction]
-                    if cur is None:
-                        cur = dict(
-                            d=t, direction=direction, od=r['Date'],
-                            of=[], ca=[], cf=[], cd=[], hc=False,
-                            is_liquidation=False
-                        )
-                        current[direction] = cur
-                    cur['of'].append(float(r.get('Fee', 0) or 0))
-
+                    if cur and cur['hc']: positions.append(cur); cur = None
+                    if cur is None: cur = dict(d=t, od=r['Date'], of=[], ca=[], cf=[], cd=[], hc=False)
+                    cur['of'].append(r['Fee'])
                 elif t in close_t:
-                    cur = current[direction]
-                    if cur is None:
-                        # Missing open leg in the export. Keep the close so it is visible.
-                        cur = dict(
-                            d='open_long' if direction == 'Long' else 'open_short',
-                            direction=direction, od=r['Date'],
-                            of=[], ca=[], cf=[], cd=[], hc=False,
-                            is_liquidation=('force_close' in t)
-                        )
-                        current[direction] = cur
-
-                    cur['hc'] = True
-                    cur['ca'].append(float(r.get('Amount', 0) or 0))
-                    cur['cf'].append(float(r.get('Fee', 0) or 0))
-                    cur['cd'].append(r['Date'])
-                    if 'force_close' in t:
-                        cur['is_liquidation'] = True
-
-                    # For Bitget transaction exports there is usually no reliable size
-                    # in this normalized ledger. We therefore close a position when a
-                    # close event appears after an open bucket, and keep additional
-                    # same-direction close fills in that bucket until the next open.
-                    positions.append(cur)
-                    current[direction] = None
-
-                elif t in liquidation_t:
-                    net = float(r.get('Amount', 0) or 0) + float(r.get('Fee', 0) or 0)
-                    trade = dict(
-                        symbol=sym, market=market,
-                        open_date=r['Date'], close_date=r['Date'],
-                        direction=direction,
-                        realized_pnl=float(r.get('Amount', 0) or 0),
-                        open_fees=0,
-                        close_fees=float(r.get('Fee', 0) or 0),
-                        funding_fees=0,
-                        net_pnl=net,
-                        is_win=False,
-                        holding_hours=0,
-                        is_liquidation=True,
-                        num_closes=1
-                    )
-                    trade['id'] = make_trade_id(trade)
-                    self.trades.append(trade)
-
+                    if cur is None: cur = dict(d='open_long' if 'long' in t else 'open_short', od=r['Date'], of=[], ca=[], cf=[], cd=[], hc=False)
+                    cur['hc'] = True; cur['ca'].append(r['Amount']); cur['cf'].append(r['Fee']); cur['cd'].append(r['Date'])
+            if cur and cur['hc']: positions.append(cur)
             for p in positions:
-                if not p.get('hc') or not p.get('cd'):
-                    continue
-                cd = max(p['cd'])
-                od = p['od']
-                real = sum(p['ca'])
-                cf = sum(p['cf'])
-                of = sum(p['of'])
-                ff = self.get_funding(sym, od, cd)
-                net = real + cf + of + ff
-                trade = dict(
-                    symbol=sym, market=market,
-                    open_date=od, close_date=cd,
-                    direction=p['direction'],
-                    realized_pnl=real,
-                    open_fees=of,
-                    close_fees=cf,
-                    funding_fees=ff,
-                    net_pnl=net,
-                    is_win=net > 0,
-                    holding_hours=(cd - od).total_seconds() / 3600,
-                    is_liquidation=bool(p.get('is_liquidation')),
-                    num_closes=len(p['ca'])
-                )
-                trade['id'] = make_trade_id(trade)
-                self.trades.append(trade)
-
-        # De-duplicate defensively when the same export is uploaded twice.
-        deduped = {}
-        for t in self.trades:
-            deduped[t['id']] = t
-        self.trades = sorted(deduped.values(), key=lambda x: x['close_date'])
+                cd = max(p['cd']); od = p['od']; real = sum(p['ca']); cf = sum(p['cf']); of = sum(p['of'])
+                ff = self.get_funding(sym, od, cd); net = real + cf + of + ff
+                trade = dict(symbol=sym, market=market, open_date=od, close_date=cd, direction='Long' if 'long' in p['d'] else 'Short',
+                             realized_pnl=real, open_fees=of, close_fees=cf, funding_fees=ff, net_pnl=net, is_win=net > 0,
+                             holding_hours=(cd - od).total_seconds() / 3600, is_liquidation=False, num_closes=len(p['ca']))
+                trade['id'] = make_trade_id(trade); self.trades.append(trade)
+            for _, r in sdf[sdf['Type'].str.contains('burst_close', na=False)].iterrows():
+                net = r['Amount'] + r['Fee']
+                trade = dict(symbol=sym, market=market, open_date=r['Date'], close_date=r['Date'],
+                             direction='Long' if 'long' in r['Type'] else 'Short', realized_pnl=r['Amount'],
+                             open_fees=0, close_fees=r['Fee'], funding_fees=0, net_pnl=net, is_win=False,
+                             holding_hours=0, is_liquidation=True, num_closes=1)
+                trade['id'] = make_trade_id(trade); self.trades.append(trade)
+        self.trades.sort(key=lambda x: x['close_date'])
 
     def stats(self, mf=None):
         tr = [t for t in self.trades if not mf or t['market'] == mf]
@@ -571,7 +477,11 @@ class TradeRepublicAnalyzer:
             realized_pnl=realized_pnl,
             fees=abs(fee_alloc),
             taxes=abs(tax_alloc),
+            tax_on_sell=tax_alloc,
+            tax_events_same_day=0.0,
+            tax_events_allocated=0.0,
             net_pnl=net_pnl,
+            net_pnl_incl_tax_events=net_pnl,
             first_buy=first_buy,
             last_sell=row.get('datetime'),
             num_buys=len(set(m.get('first_buy') for m in matched)),
@@ -651,6 +561,88 @@ class TradeRepublicAnalyzer:
                 {**r.to_dict(), 'datetime': first_buy},
                 source=r['type']
             )
+
+    def _trade_date(self, value):
+        if pd.isna(value):
+            return None
+        ts = pd.Timestamp(value)
+        if ts.tzinfo is not None:
+            ts = ts.tz_convert(None)
+        return ts.date()
+
+    def _tax_event_rows(self):
+        """Standalone Trade Republic tax events that are not attached to SELL rows.
+
+        TAX_OPTIMIZATION is often a same-day tax refund/adjustment without symbol.
+        PRE_DETERMINED_TAX_BASE can be a standalone tax debit with symbol.
+        Values are kept signed: positive tax increases cash/P&L, negative tax reduces it.
+        """
+        df = self.df.copy()
+        tax_types = df['type'].astype(str).str.contains('TAX', case=False, na=False) | df['type'].isin(['PRE_DETERMINED_TAX_BASE'])
+        events = df[(df['category'] == 'CASH') & tax_types].copy()
+        if events.empty:
+            return events
+        events['tax_event_amount'] = pd.to_numeric(events['tax'], errors='coerce').fillna(0.0)
+        # Fallback for future exports where the cash adjustment is in amount instead of tax.
+        missing = events['tax_event_amount'].abs() <= self.EPS
+        events.loc[missing, 'tax_event_amount'] = pd.to_numeric(events.loc[missing, 'amount'], errors='coerce').fillna(0.0)
+        events = events[events['tax_event_amount'].abs() > self.EPS].copy()
+        events['trade_date'] = events['datetime'].apply(self._trade_date)
+        return events
+
+    def _attach_same_day_tax_events(self):
+        """Attach standalone tax events to closed positions by date.
+
+        The CSV often contains tax optimisation rows without symbol/ISIN. We therefore
+        cannot assign them perfectly to one position. The app shows:
+        - tax_on_sell: tax directly on the SELL/TILG row
+        - tax_events_same_day: all standalone tax events on that sell date
+        - tax_events_allocated: same-day tax event allocated to this row
+        - net_pnl_incl_tax_events: net_pnl plus allocated same-day tax event
+        """
+        if not self.closed_positions:
+            return
+
+        tax_events = self._tax_event_rows()
+        if tax_events.empty:
+            return
+
+        events_by_date = tax_events.groupby('trade_date')['tax_event_amount'].sum().to_dict()
+        rows_by_date = {}
+        for i, pos in enumerate(self.closed_positions):
+            d = self._trade_date(pos.get('last_sell'))
+            if d is not None:
+                rows_by_date.setdefault(d, []).append(i)
+
+        for d, idxs in rows_by_date.items():
+            same_day_total = float(events_by_date.get(d, 0.0) or 0.0)
+            if abs(same_day_total) <= self.EPS:
+                continue
+
+            # Prefer allocating tax adjustments to profitable closes because German taxes
+            # generally relate to taxable gains. Fall back to gross proceeds, then equal split.
+            positives = [max(float(self.closed_positions[i].get('realized_pnl', 0.0) or 0.0), 0.0) for i in idxs]
+            denom = sum(positives)
+            if denom <= self.EPS:
+                positives = [abs(float(self.closed_positions[i].get('avg_sell_price', 0.0) or 0.0) * float(self.closed_positions[i].get('shares_sold', 0.0) or 0.0)) for i in idxs]
+                denom = sum(positives)
+            if denom <= self.EPS:
+                positives = [1.0 for _ in idxs]
+                denom = float(len(idxs))
+
+            for weight, i in zip(positives, idxs):
+                alloc = same_day_total * (weight / denom)
+                self.closed_positions[i]['tax_events_same_day'] = same_day_total
+                self.closed_positions[i]['tax_events_allocated'] = alloc
+                self.closed_positions[i]['net_pnl_incl_tax_events'] = self.closed_positions[i].get('net_pnl', 0.0) + alloc
+
+    def tax_events_df(self):
+        events = self._tax_event_rows()
+        if events.empty:
+            return pd.DataFrame()
+        out = events[['date', 'datetime', 'type', 'name', 'symbol', 'tax_event_amount', 'description', 'transaction_id']].copy()
+        out = out.sort_values('datetime', ascending=False)
+        return out.reset_index(drop=True)
 
     def analyze(self):
         df = self.df.copy()
@@ -760,6 +752,8 @@ class TradeRepublicAnalyzer:
                 lot_source=', '.join(sources),
             ))
 
+        self._attach_same_day_tax_events()
+
         self.closed_positions.sort(key=lambda p: p['last_sell'] if pd.notna(p['last_sell']) else pd.Timestamp.min.tz_localize('UTC'))
         self.open_positions.sort(key=lambda p: p['total_cost'], reverse=True)
 
@@ -772,9 +766,11 @@ class TradeRepublicAnalyzer:
         interest = self.df[self.df['type'] == 'INTEREST_PAYMENT']['amount'].sum()
         total_fees = abs(trading['fee'].sum()) + abs(self.df[self.df['type'] == 'FEE']['fee'].sum())
         tilg_taxes = abs(self.df[(self.df['type'] == 'TILG')]['tax'].sum()) if 'tax' in self.df.columns else 0
+        standalone_tax_events = self._tax_event_rows()
+        standalone_tax_total = standalone_tax_events['tax_event_amount'].sum() if not standalone_tax_events.empty else 0.0
         total_taxes = abs(trading['tax'].sum()) + tilg_taxes + abs(self.df[self.df['type'].isin(['DIVIDEND', 'INTEREST_PAYMENT'])]['tax'].sum())
         realized_pnl = sum(p['realized_pnl'] for p in self.closed_positions)
-        net_pnl = sum(p['net_pnl'] for p in self.closed_positions)
+        net_pnl = sum(p.get('net_pnl_incl_tax_events', p['net_pnl']) for p in self.closed_positions)
         open_cost = sum(p['total_cost'] for p in self.open_positions)
         wins = sum(1 for p in self.closed_positions if p['net_pnl'] > 0)
         losses = len(self.closed_positions) - wins
@@ -788,6 +784,7 @@ class TradeRepublicAnalyzer:
             closed_count=len(self.closed_positions), open_count=len(self.open_positions),
             wins=wins, losses=losses, win_rate=wins / len(self.closed_positions) * 100 if self.closed_positions else 0,
             date_range=date_range,
+            standalone_tax_total=standalone_tax_total,
             issues=len(self.data_quality_issues),
             unmatched=len(self.unmatched_closures),
         )
@@ -802,8 +799,8 @@ class TradeRepublicAnalyzer:
             out[ac]['realized'] += p['realized_pnl']
             out[ac]['fees'] += p['fees']
             out[ac]['taxes'] += p['taxes']
-            out[ac]['net'] += p['net_pnl']
-            if p['net_pnl'] > 0:
+            out[ac]['net'] += p.get('net_pnl_incl_tax_events', p['net_pnl'])
+            if p.get('net_pnl_incl_tax_events', p['net_pnl']) > 0:
                 out[ac]['wins'] += 1
         for ac in out:
             out[ac]['win_rate'] = out[ac]['wins'] / out[ac]['count'] * 100 if out[ac]['count'] else 0
@@ -922,12 +919,28 @@ def render_tr_tab(tr: TradeRepublicAnalyzer):
 
     # Income
     with st.expander("💰 Cash Flow & Income"):
-        c1, c2, c3, c4, c5 = st.columns(5)
+        c1, c2, c3, c4, c5, c6 = st.columns(6)
         with c1: st.metric("Dividends", f"{s['dividends']:,.2f} €")
         with c2: st.metric("Interest", f"{s['interest']:,.2f} €")
         with c3: st.metric("Trading Fees", f"-{s['total_fees']:,.2f} €")
-        with c4: st.metric("Taxes Paid", f"-{s['total_taxes']:,.2f} €")
-        with c5: st.metric("Open Positions Cost", f"{s['open_cost']:,.2f} €")
+        with c4: st.metric("Direct Taxes", f"-{s['total_taxes']:,.2f} €")
+        with c5: st.metric("Tax Events", f"{s.get('standalone_tax_total', 0):+,.2f} €")
+        with c6: st.metric("Open Cost", f"{s['open_cost']:,.2f} €")
+
+    tax_events_table = tr.tax_events_df()
+    if not tax_events_table.empty:
+        with st.expander("🧾 Standalone tax events / tax optimizations"):
+            st.caption("Signed values: positive = tax refund/optimization; negative = tax debit. These rows are allocated by sell date in 'Net incl. Tax Events'.")
+            tax_disp = pd.DataFrame({
+                'Date': tax_events_table['date'].dt.strftime('%Y-%m-%d'),
+                'Type': tax_events_table['type'],
+                'Name': tax_events_table['name'].fillna(''),
+                'Symbol': tax_events_table['symbol'].fillna(''),
+                'Tax Event': tax_events_table['tax_event_amount'].round(2),
+                'Description': tax_events_table['description'].fillna(''),
+            })
+            st.dataframe(tax_disp, use_container_width=True, hide_index=True,
+                column_config={'Tax Event': st.column_config.NumberColumn('Tax Event €', format="%+.2f")})
 
     # By asset class
     st.markdown('<div class="dash-header">📊 P&L by Asset Class</div>', unsafe_allow_html=True)
@@ -969,17 +982,33 @@ def render_tr_tab(tr: TradeRepublicAnalyzer):
     if tr.closed_positions:
         cp_df = pd.DataFrame(tr.closed_positions)
 
-        c1, c2, c3 = st.columns(3)
+        c1, c2, c3, c4 = st.columns([2, 1, 1, 1])
         with c1:
-            ac_filter = st.selectbox("Asset Class", ['All'] + sorted(cp_df['asset_class'].unique().tolist()), key='tr_ac')
+            closed_search = st.text_input(
+                "Search closed positions",
+                placeholder="Name, Symbol/ISIN oder Klasse suchen...",
+                key='tr_closed_search'
+            )
         with c2:
-            tr_res = st.selectbox("Result", ['All', 'Win', 'Loss'], key='tr_res')
+            ac_filter = st.selectbox("Asset Class", ['All'] + sorted(cp_df['asset_class'].fillna('UNKNOWN').unique().tolist()), key='tr_ac')
         with c3:
+            tr_res = st.selectbox("Result", ['All', 'Win', 'Loss'], key='tr_res')
+        with c4:
             tr_sort_map = {'P&L best ↓': ('realized_pnl', False), 'P&L worst ↓': ('realized_pnl', True),
-                           'Last sell ↓': ('last_sell', False), 'Last sell ↑': ('last_sell', True)}
+                           'Last sell ↓': ('last_sell', False), 'Last sell ↑': ('last_sell', True),
+                           'Buy date ↓': ('first_buy', False), 'Buy date ↑': ('first_buy', True)}
             tr_sort = st.selectbox("Sort", list(tr_sort_map.keys()), key='tr_sort')
 
-        if ac_filter != 'All': cp_df = cp_df[cp_df['asset_class'] == ac_filter]
+        if ac_filter != 'All': cp_df = cp_df[cp_df['asset_class'].fillna('UNKNOWN') == ac_filter]
+        if closed_search:
+            q = closed_search.strip().lower()
+            searchable = (
+                cp_df['name'].fillna('').astype(str) + ' ' +
+                cp_df['symbol'].fillna('').astype(str) + ' ' +
+                cp_df['asset_class'].fillna('').astype(str) + ' ' +
+                cp_df.get('close_type', pd.Series('', index=cp_df.index)).fillna('').astype(str)
+            ).str.lower()
+            cp_df = cp_df[searchable.str.contains(re.escape(q), na=False)]
         if tr_res == 'Win': cp_df = cp_df[cp_df['realized_pnl'] > 0]
         elif tr_res == 'Loss': cp_df = cp_df[cp_df['realized_pnl'] <= 0]
         sc, asc = tr_sort_map[tr_sort]; cp_df = cp_df.sort_values(sc, ascending=asc)
@@ -992,8 +1021,12 @@ def render_tr_tab(tr: TradeRepublicAnalyzer):
                 'Shares Sold': cp_df['shares_sold'].round(4),
                 'Avg Buy': cp_df['avg_buy_price'].round(2), 'Avg Sell': cp_df['avg_sell_price'].round(2),
                 'Realized P&L': cp_df['realized_pnl'].round(2), 'Fees': cp_df['fees'].round(2),
-                'Taxes': cp_df['taxes'].round(2), 'Net P&L': cp_df['net_pnl'].round(2),
-                'Result': cp_df['realized_pnl'].apply(lambda x: '✅' if x > 0 else '❌'),
+                'Tax on Sell': cp_df.get('tax_on_sell', pd.Series(0.0, index=cp_df.index)).round(2),
+                'Tax Events same day': cp_df.get('tax_events_same_day', pd.Series(0.0, index=cp_df.index)).round(2),
+                'Tax Events allocated': cp_df.get('tax_events_allocated', pd.Series(0.0, index=cp_df.index)).round(2),
+                'Net P&L': cp_df['net_pnl'].round(2),
+                'Net incl. Tax Events': cp_df.get('net_pnl_incl_tax_events', cp_df['net_pnl']).round(2),
+                'Result': cp_df.get('net_pnl_incl_tax_events', cp_df['net_pnl']).apply(lambda x: '✅' if x > 0 else '❌'),
                 'How': cp_df.get('close_type', pd.Series(['SELL']*len(cp_df))).map(
                     {'SELL': '💰 Sold', 'KNOCKOUT': '💥 KO', 'TRANSFER': '📤 Transfer'}).fillna('💰 Sold'),
             })
@@ -1002,9 +1035,12 @@ def render_tr_tab(tr: TradeRepublicAnalyzer):
                 height=min(600, 38 + len(disp_cp)*35),
                 column_config={
                     'Realized P&L': st.column_config.NumberColumn('Realized', format="%.2f"),
-                    'Net P&L': st.column_config.NumberColumn('Net', format="%.2f"),
+                    'Net P&L': st.column_config.NumberColumn('Net direct', format="%.2f"),
+                    'Net incl. Tax Events': st.column_config.NumberColumn('Net incl. Tax Events', format="%.2f"),
                     'Fees': st.column_config.NumberColumn('Fees', format="%.2f"),
-                    'Taxes': st.column_config.NumberColumn('Tax', format="%.2f"),
+                    'Tax on Sell': st.column_config.NumberColumn('Tax on Sell', format="%+.2f"),
+                    'Tax Events same day': st.column_config.NumberColumn('Tax Events same day', format="%+.2f"),
+                    'Tax Events allocated': st.column_config.NumberColumn('Tax Events allocated', format="%+.2f"),
                     'Avg Buy': st.column_config.NumberColumn('Avg Buy', format="%.2f"),
                     'Avg Sell': st.column_config.NumberColumn('Avg Sell', format="%.2f"),
                 })
@@ -1020,13 +1056,38 @@ def render_tr_tab(tr: TradeRepublicAnalyzer):
     if tr.open_positions:
         st.markdown('<div class="dash-header">📂 Open Positions</div>', unsafe_allow_html=True)
         op_df = pd.DataFrame(tr.open_positions).sort_values('total_cost', ascending=False)
-        op_ac = st.selectbox(
-            "Open Asset Class",
-            ['All'] + sorted(op_df['asset_class'].fillna('UNKNOWN').unique().tolist()),
-            key='tr_open_ac'
-        )
+        oc1, oc2, oc3 = st.columns([2, 1, 1])
+        with oc1:
+            open_search = st.text_input(
+                "Search open positions",
+                placeholder="Name, Symbol/ISIN oder Klasse suchen...",
+                key='tr_open_search'
+            )
+        with oc2:
+            op_ac = st.selectbox(
+                "Open Asset Class",
+                ['All'] + sorted(op_df['asset_class'].fillna('UNKNOWN').unique().tolist()),
+                key='tr_open_ac'
+            )
+        with oc3:
+            op_sort_map = {
+                'Invested ↓': ('total_cost', False), 'Invested ↑': ('total_cost', True),
+                'First buy ↓': ('first_buy', False), 'First buy ↑': ('first_buy', True),
+                'Name A-Z': ('name', True), 'Name Z-A': ('name', False)
+            }
+            op_sort = st.selectbox("Sort open", list(op_sort_map.keys()), key='tr_open_sort')
         if op_ac != 'All':
-            op_df = op_df[op_df['asset_class'] == op_ac]
+            op_df = op_df[op_df['asset_class'].fillna('UNKNOWN') == op_ac]
+        if open_search:
+            q = open_search.strip().lower()
+            searchable = (
+                op_df['name'].fillna('').astype(str) + ' ' +
+                op_df['symbol'].fillna('').astype(str) + ' ' +
+                op_df['asset_class'].fillna('').astype(str)
+            ).str.lower()
+            op_df = op_df[searchable.str.contains(re.escape(q), na=False)]
+        op_sc, op_asc = op_sort_map[op_sort]
+        op_df = op_df.sort_values(op_sc, ascending=op_asc)
         disp_op = pd.DataFrame({
             'First Buy': op_df['first_buy'].dt.strftime('%Y-%m-%d'),
             'Last Buy': op_df['last_buy'].dt.strftime('%Y-%m-%d') if 'last_buy' in op_df else op_df['first_buy'].dt.strftime('%Y-%m-%d'),
