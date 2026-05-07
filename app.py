@@ -1,25 +1,82 @@
 """
 Bitget Trading Analytics Dashboard
-Groups opens + partial closes into positions
-Correctly calculates P&L including fees and funding
-Supports USDT-M and USDC-M file uploads
+Position-based P&L · Multi-account · Bitget-style dark UI
 """
 
 import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
-import plotly.express as px
-from datetime import datetime, timedelta
+from datetime import datetime
 import io
 import base64
 
+# ─── Page config & theme ────────────────────────────────────────────
 st.set_page_config(
-    page_title="Bitget Trading Dashboard",
+    page_title="Trading Dashboard",
     page_icon="📊",
-    layout="wide"
+    layout="wide",
 )
 
+# ─── Bitget-style CSS ───────────────────────────────────────────────
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
+.stApp { background-color: #0D1117; color: #E6EDF3; }
+header[data-testid="stHeader"] { background: #0D1117; }
+
+section[data-testid="stSidebar"] {
+    background: #161B22; border-right: 1px solid #21262D;
+}
+section[data-testid="stSidebar"] .stMarkdown p,
+section[data-testid="stSidebar"] .stMarkdown li,
+section[data-testid="stSidebar"] label { color: #8B949E; }
+section[data-testid="stSidebar"] h1,
+section[data-testid="stSidebar"] h2,
+section[data-testid="stSidebar"] h3 { color: #E6EDF3; }
+
+div[data-testid="stMetric"] {
+    background: #161B22; border: 1px solid #21262D;
+    border-radius: 12px; padding: 16px 20px;
+}
+div[data-testid="stMetric"] label { color: #8B949E !important; font-size: 13px; }
+div[data-testid="stMetric"] [data-testid="stMetricValue"] {
+    color: #E6EDF3 !important; font-size: 22px; font-weight: 600;
+}
+
+div[data-testid="stExpander"] {
+    background: #161B22; border: 1px solid #21262D; border-radius: 12px;
+}
+button[data-baseweb="tab"] { color: #8B949E !important; font-weight: 500; }
+button[data-baseweb="tab"][aria-selected="true"] { color: #00E5A0 !important; }
+div[data-baseweb="tab-highlight"] { background-color: #00E5A0 !important; }
+
+div[data-testid="stDataFrame"] {
+    border: 1px solid #21262D; border-radius: 12px; overflow: hidden;
+}
+div[data-baseweb="select"] > div {
+    background-color: #161B22 !important; border-color: #30363D !important;
+}
+
+.dash-header {
+    color: #E6EDF3; font-size: 18px; font-weight: 600;
+    margin: 28px 0 12px 0; padding-bottom: 8px; border-bottom: 1px solid #21262D;
+}
+.account-card {
+    background: #161B22; border: 1px solid #21262D;
+    border-radius: 14px; padding: 24px; margin-bottom: 16px;
+}
+.account-card h3 { margin: 0 0 16px 0; font-size: 16px; }
+.account-card .big-pnl { font-size: 32px; font-weight: 700; }
+.block-container { padding-top: 2rem; }
+</style>
+""", unsafe_allow_html=True)
+
+
+# ═════════════════════════════════════════════════════════════════════
+# ANALYZER CLASS
+# ═════════════════════════════════════════════════════════════════════
 
 class BitgetAnalyzer:
     def __init__(self, df):
@@ -32,565 +89,495 @@ class BitgetAnalyzer:
         content = uploaded_file.getvalue().decode('utf-8-sig')
         df = pd.read_csv(io.StringIO(content))
         df.columns = [col.strip() for col in df.columns]
-
-        # Strip leading tabs/whitespace from the Order column
         if 'Order' in df.columns:
             df['Order'] = df['Order'].astype(str).str.strip()
-
         df['Date'] = pd.to_datetime(df['Date'].str.strip())
         df['Amount'] = pd.to_numeric(df['Amount'], errors='coerce').fillna(0)
         df['Fee'] = pd.to_numeric(df['Fee'], errors='coerce').fillna(0)
-
-        # Detect market type from Coin column
         if 'Coin' in df.columns:
-            coin_val = df['Coin'].str.strip().iloc[0] if len(df) > 0 else ''
-            if coin_val == 'USDC':
-                df['Market'] = 'USDC-M'
-            else:
-                df['Market'] = 'USDT-M'
+            coin = df['Coin'].str.strip().iloc[0] if len(df) > 0 else ''
+            df['Market'] = 'USDC-M' if coin == 'USDC' else 'USDT-M'
         else:
             df['Market'] = 'Unknown'
-
         return df
 
     @staticmethod
     def merge_dataframes(dfs):
-        """Merge multiple DataFrames from different uploads."""
         if len(dfs) == 1:
             return dfs[0]
         combined = pd.concat(dfs, ignore_index=True)
-        # Deduplicate by Order ID in case of overlapping exports
         if 'Order' in combined.columns:
             combined = combined.drop_duplicates(subset='Order', keep='first')
-        combined = combined.sort_values('Date').reset_index(drop=True)
-        return combined
+        return combined.sort_values('Date').reset_index(drop=True)
 
-    def get_funding_fees_for_position(self, symbol, open_date, close_date):
-        """Calculate total funding fees for a position between open and close dates."""
-        funding_df = self.df[
-            (self.df['Futures'] == symbol) &
-            (self.df['Type'] == 'contract_margin_settle_fee') &
-            (self.df['Date'] >= open_date) &
-            (self.df['Date'] <= close_date)
+    def get_funding_fees(self, symbol, open_date, close_date):
+        f = self.df[
+            (self.df['Futures'] == symbol)
+            & (self.df['Type'] == 'contract_margin_settle_fee')
+            & (self.df['Date'] >= open_date)
+            & (self.df['Date'] <= close_date)
         ]
-        return funding_df['Amount'].sum()
+        return f['Amount'].sum()
 
     def parse_trades(self):
-        """
-        Group opens and closes into positions per symbol.
+        open_types = {'open_short', 'open_long'}
+        close_types = {'close_short', 'close_long'}
+        valid = self.df[
+            self.df['Futures'].notna()
+            & (self.df['Futures'].astype(str).str.strip() != '')
+            & (self.df['Futures'].astype(str) != 'nan')
+        ]
 
-        A position starts when we see an open (open_long/open_short) with no
-        active position. It accumulates subsequent opens (adding to position)
-        and closes (partial/full). The position ends when a NEW open appears
-        AFTER at least one close has occurred, or at end of data.
-
-        P&L = sum(close_amounts) + sum(close_fees) + sum(open_fees) + funding_fees
-        (fees are negative values = costs, so adding them subtracts from P&L)
-        """
-        trade_types_open = {'open_short', 'open_long'}
-        trade_types_close = {'close_short', 'close_long'}
-
-        # Filter out rows without a valid Futures symbol (transfers, deposits, etc.)
-        valid_df = self.df[self.df['Futures'].notna() & (self.df['Futures'].astype(str).str.strip() != '')]
-
-        for symbol in valid_df['Futures'].unique():
-            symbol_df = valid_df[valid_df['Futures'] == symbol].sort_values('Date')
-
-            if symbol_df.empty:
+        for symbol in valid['Futures'].unique():
+            sdf = valid[valid['Futures'] == symbol].sort_values('Date')
+            if sdf.empty:
                 continue
+            market = sdf['Market'].iloc[0] if 'Market' in sdf.columns else '?'
 
-            # Detect market type for this symbol
-            market = symbol_df['Market'].iloc[0] if 'Market' in symbol_df.columns else 'Unknown'
+            positions, cur = [], None
+            for _, r in sdf.iterrows():
+                t = r['Type']
+                if t in open_types:
+                    if cur and cur['has_close']:
+                        positions.append(cur)
+                        cur = None
+                    if cur is None:
+                        cur = dict(
+                            direction=t, open_date=r['Date'],
+                            open_fees=[], close_amounts=[], close_fees=[],
+                            close_dates=[], has_close=False,
+                        )
+                    cur['open_fees'].append(r['Fee'])
+                elif t in close_types:
+                    if cur is None:
+                        cur = dict(
+                            direction='open_long' if t == 'close_long' else 'open_short',
+                            open_date=r['Date'],
+                            open_fees=[], close_amounts=[], close_fees=[],
+                            close_dates=[], has_close=False,
+                        )
+                    cur['has_close'] = True
+                    cur['close_amounts'].append(r['Amount'])
+                    cur['close_fees'].append(r['Fee'])
+                    cur['close_dates'].append(r['Date'])
+            if cur and cur['has_close']:
+                positions.append(cur)
 
-            positions = []
-            current = None  # Current position being built
+            for p in positions:
+                cd = max(p['close_dates'])
+                od = p['open_date']
+                realized = sum(p['close_amounts'])
+                cf = sum(p['close_fees'])
+                of_ = sum(p['open_fees'])
+                ff = self.get_funding_fees(symbol, od, cd)
+                net = realized + cf + of_ + ff
+                self.trades.append(dict(
+                    symbol=symbol, market=market,
+                    open_date=od, close_date=cd,
+                    direction='Long' if 'long' in p['direction'] else 'Short',
+                    realized_pnl=realized,
+                    open_fees=of_, close_fees=cf, funding_fees=ff,
+                    net_pnl=net, is_win=net > 0,
+                    holding_hours=(cd - od).total_seconds() / 3600,
+                    is_liquidation=False,
+                    num_closes=len(p['close_amounts']),
+                ))
 
-            for _, row in symbol_df.iterrows():
-                txn_type = row['Type']
-
-                if txn_type in trade_types_open:
-                    if current is not None and current['has_close']:
-                        # Previous position had closes → finalize it, start new
-                        positions.append(current)
-                        current = None
-
-                    if current is None:
-                        current = {
-                            'direction': txn_type,
-                            'open_date': row['Date'],
-                            'open_fees': [],
-                            'close_amounts': [],
-                            'close_fees': [],
-                            'close_dates': [],
-                            'has_close': False,
-                        }
-
-                    current['open_fees'].append(row['Fee'])
-
-                elif txn_type in trade_types_close:
-                    if current is None:
-                        # Orphan close (no matching open in data) — create minimal position
-                        current = {
-                            'direction': 'open_long' if txn_type == 'close_long' else 'open_short',
-                            'open_date': row['Date'],
-                            'open_fees': [],
-                            'close_amounts': [],
-                            'close_fees': [],
-                            'close_dates': [],
-                            'has_close': False,
-                        }
-
-                    current['has_close'] = True
-                    current['close_amounts'].append(row['Amount'])
-                    current['close_fees'].append(row['Fee'])
-                    current['close_dates'].append(row['Date'])
-
-            # Don't forget the last position
-            if current is not None and current['has_close']:
-                positions.append(current)
-
-            # Convert positions to trade records
-            for pos in positions:
-                close_date = max(pos['close_dates'])
-                open_date = pos['open_date']
-
-                # Realized P&L from price movement
-                realized_pnl = sum(pos['close_amounts'])
-
-                # Fees (all negative = costs)
-                total_close_fees = sum(pos['close_fees'])
-                total_open_fees = sum(pos['open_fees'])
-
-                # Funding fees during position lifetime
-                funding_fees = self.get_funding_fees_for_position(
-                    symbol, open_date, close_date
-                )
-
-                # Net P&L: realized + fees (negative) + funding
-                net_pnl = realized_pnl + total_close_fees + total_open_fees + funding_fees
-
-                is_win = net_pnl > 0
-                holding_hours = (close_date - open_date).total_seconds() / 3600
-
-                direction_label = 'Long' if 'long' in pos['direction'] else 'Short'
-
-                self.trades.append({
-                    'symbol': symbol,
-                    'market': market,
-                    'open_date': open_date,
-                    'close_date': close_date,
-                    'direction': direction_label,
-                    'realized_pnl': realized_pnl,
-                    'open_fees': total_open_fees,
-                    'close_fees': total_close_fees,
-                    'funding_fees': funding_fees,
-                    'net_pnl': net_pnl,
-                    'is_win': is_win,
-                    'holding_hours': holding_hours,
-                    'is_liquidation': False,
-                    'num_closes': len(pos['close_amounts']),
-                })
-
-            # Handle liquidations separately
-            liquidation_rows = symbol_df[
-                symbol_df['Type'].str.contains('burst_close', na=False)
-            ]
-            for _, row in liquidation_rows.iterrows():
-                pnl = row['Amount']
-                fee = row['Fee']
-                net_pnl = pnl + fee  # fee is negative
-
-                direction_label = 'Short' if 'short' in row['Type'] else 'Long'
-
-                self.trades.append({
-                    'symbol': symbol,
-                    'market': market,
-                    'open_date': row['Date'],
-                    'close_date': row['Date'],
-                    'direction': direction_label,
-                    'realized_pnl': pnl,
-                    'open_fees': 0,
-                    'close_fees': fee,
-                    'funding_fees': 0,
-                    'net_pnl': net_pnl,
-                    'is_win': False,
-                    'holding_hours': 0,
-                    'is_liquidation': True,
-                    'num_closes': 1,
-                })
+            for _, r in sdf[sdf['Type'].str.contains('burst_close', na=False)].iterrows():
+                net = r['Amount'] + r['Fee']
+                self.trades.append(dict(
+                    symbol=symbol, market=market,
+                    open_date=r['Date'], close_date=r['Date'],
+                    direction='Long' if 'long' in r['Type'] else 'Short',
+                    realized_pnl=r['Amount'],
+                    open_fees=0, close_fees=r['Fee'], funding_fees=0,
+                    net_pnl=net, is_win=False,
+                    holding_hours=0, is_liquidation=True, num_closes=1,
+                ))
 
         self.trades.sort(key=lambda x: x['close_date'])
 
-    def get_summary_stats(self):
-        if not self.trades:
-            return {}
-
-        total_trades = len(self.trades)
-        liquidation_count = sum(1 for t in self.trades if t['is_liquidation'])
-        normal_count = total_trades - liquidation_count
-
-        winning_trades = sum(1 for t in self.trades if t['is_win'])
-        losing_trades = total_trades - winning_trades
-        win_rate = (winning_trades / total_trades) * 100 if total_trades > 0 else 0
-
-        total_pnl = sum(t['net_pnl'] for t in self.trades)
-        gross_profit = sum(t['net_pnl'] for t in self.trades if t['net_pnl'] > 0)
-        gross_loss = abs(sum(t['net_pnl'] for t in self.trades if t['net_pnl'] < 0))
-        profit_factor = gross_profit / gross_loss if gross_loss > 0 else float('inf')
-
-        total_funding_fees = sum(t['funding_fees'] for t in self.trades)
-        total_open_fees = sum(t['open_fees'] for t in self.trades)
-        total_close_fees = sum(t['close_fees'] for t in self.trades)
-        total_trading_fees = total_open_fees + total_close_fees
-
-        avg_win = (
-            sum(t['net_pnl'] for t in self.trades if t['net_pnl'] > 0) / winning_trades
-            if winning_trades > 0 else 0
-        )
-        avg_loss = (
-            sum(t['net_pnl'] for t in self.trades if t['net_pnl'] < 0) / losing_trades
-            if losing_trades > 0 else 0
-        )
-
-        best_trade = max(self.trades, key=lambda x: x['net_pnl']) if self.trades else None
-        worst_trade = min(self.trades, key=lambda x: x['net_pnl']) if self.trades else None
-
-        returns = [t['net_pnl'] for t in self.trades]
-        sharpe = (
-            (np.mean(returns) / np.std(returns)) * np.sqrt(252)
-            if np.std(returns) > 0 else 0
+    def stats(self, market_filter=None):
+        trades = self.trades
+        if market_filter:
+            trades = [t for t in trades if t['market'] == market_filter]
+        if not trades:
+            return None
+        n = len(trades)
+        wins = sum(1 for t in trades if t['is_win'])
+        losses = n - wins
+        liqs = sum(1 for t in trades if t['is_liquidation'])
+        total_pnl = sum(t['net_pnl'] for t in trades)
+        gp = sum(t['net_pnl'] for t in trades if t['net_pnl'] > 0)
+        gl = abs(sum(t['net_pnl'] for t in trades if t['net_pnl'] < 0))
+        pf = gp / gl if gl > 0 else float('inf')
+        ff = sum(t['funding_fees'] for t in trades)
+        tf = sum(t['open_fees'] + t['close_fees'] for t in trades)
+        rets = [t['net_pnl'] for t in trades]
+        sharpe = (np.mean(rets) / np.std(rets)) * np.sqrt(252) if np.std(rets) > 0 else 0
+        cum = np.cumsum(rets)
+        dd = cum - np.maximum.accumulate(cum)
+        mdd = np.min(dd) if len(dd) > 0 else 0
+        best = max(trades, key=lambda x: x['net_pnl'])
+        worst = min(trades, key=lambda x: x['net_pnl'])
+        hh = [t['holding_hours'] for t in trades if t['holding_hours'] > 0]
+        return dict(
+            trades=n, wins=wins, losses=losses, liqs=liqs,
+            win_rate=wins / n * 100, total_pnl=total_pnl,
+            gross_profit=gp, gross_loss=gl, profit_factor=pf,
+            avg_win=gp / wins if wins else 0, avg_loss=-gl / losses if losses else 0,
+            funding_fees=ff, trading_fees=tf,
+            sharpe=sharpe, max_drawdown=mdd,
+            expectancy=total_pnl / n,
+            avg_holding=np.mean(hh) if hh else 0,
+            best=best, worst=worst,
         )
 
-        cumulative = np.cumsum(returns)
-        running_max = np.maximum.accumulate(cumulative)
-        drawdown = cumulative - running_max
-        max_drawdown = np.min(drawdown) if len(drawdown) > 0 else 0
+    def symbol_breakdown(self, market_filter=None):
+        trades = self.trades
+        if market_filter:
+            trades = [t for t in trades if t['market'] == market_filter]
+        out = {}
+        for t in trades:
+            s = t['symbol']
+            if s not in out:
+                out[s] = dict(trades=0, wins=0, pnl=0, funding=0, liqs=0, market=t['market'])
+            out[s]['trades'] += 1
+            if t['is_win']:
+                out[s]['wins'] += 1
+            out[s]['pnl'] += t['net_pnl']
+            out[s]['funding'] += t['funding_fees']
+            if t['is_liquidation']:
+                out[s]['liqs'] += 1
+        for s in out:
+            out[s]['win_rate'] = out[s]['wins'] / out[s]['trades'] * 100 if out[s]['trades'] else 0
+        return out
 
-        expectancy = total_pnl / total_trades if total_trades > 0 else 0
-
-        holding_hours = [t['holding_hours'] for t in self.trades if t['holding_hours'] > 0]
-        avg_holding = np.mean(holding_hours) if holding_hours else 0
-
-        return {
-            'total_trades': total_trades,
-            'normal_trades': normal_count,
-            'liquidation_trades': liquidation_count,
-            'winning_trades': winning_trades,
-            'losing_trades': losing_trades,
-            'win_rate': win_rate,
-            'total_pnl': total_pnl,
-            'gross_profit': gross_profit,
-            'gross_loss': gross_loss,
-            'profit_factor': profit_factor,
-            'avg_win': avg_win,
-            'avg_loss': avg_loss,
-            'best_trade': best_trade,
-            'worst_trade': worst_trade,
-            'sharpe_ratio': sharpe,
-            'max_drawdown': max_drawdown,
-            'expectancy': expectancy,
-            'avg_holding_hours': avg_holding,
-            'total_funding_fees': total_funding_fees,
-            'total_trading_fees': total_trading_fees,
-            'total_open_fees': total_open_fees,
-            'total_close_fees': total_close_fees,
-        }
-
-    def get_symbol_breakdown(self):
-        symbol_stats = {}
-        for trade in self.trades:
-            sym = trade['symbol']
-            if sym not in symbol_stats:
-                symbol_stats[sym] = {
-                    'trades': 0,
-                    'wins': 0,
-                    'total_pnl': 0,
-                    'total_funding_fees': 0,
-                    'liquidations': 0,
-                    'liquidation_pnl': 0,
-                    'market': trade.get('market', ''),
-                }
-            symbol_stats[sym]['trades'] += 1
-            if trade['is_win']:
-                symbol_stats[sym]['wins'] += 1
-            symbol_stats[sym]['total_pnl'] += trade['net_pnl']
-            symbol_stats[sym]['total_funding_fees'] += trade['funding_fees']
-            if trade['is_liquidation']:
-                symbol_stats[sym]['liquidations'] += 1
-                symbol_stats[sym]['liquidation_pnl'] += trade['net_pnl']
-
-        for sym in symbol_stats:
-            s = symbol_stats[sym]
-            s['win_rate'] = (s['wins'] / s['trades']) * 100 if s['trades'] > 0 else 0
-            s['avg_pnl'] = s['total_pnl'] / s['trades'] if s['trades'] > 0 else 0
-
-        return symbol_stats
-
-    def get_time_series_data(self):
-        if not self.trades:
+    def cumulative_series(self, market_filter=None):
+        trades = self.trades
+        if market_filter:
+            trades = [t for t in trades if t['market'] == market_filter]
+        if not trades:
             return pd.DataFrame()
-
-        dates = [t['close_date'] for t in self.trades]
-        cumulative_pnl = np.cumsum([t['net_pnl'] for t in self.trades])
-        rolling_winrate = []
-        liquidation_flags = [1 if t['is_liquidation'] else 0 for t in self.trades]
-
-        for i in range(len(self.trades)):
-            window = self.trades[max(0, i - 19):i + 1]
-            winrate = (sum(1 for t in window if t['is_win']) / len(window)) * 100
-            rolling_winrate.append(winrate)
-
-        return pd.DataFrame({
-            'date': dates,
-            'pnl': [t['net_pnl'] for t in self.trades],
-            'cumulative_pnl': cumulative_pnl,
-            'rolling_winrate': rolling_winrate,
-            'trade_number': range(1, len(self.trades) + 1),
-            'is_liquidation': liquidation_flags,
-        })
-
-    def get_trades_df(self):
-        return pd.DataFrame(self.trades)
+        cum = np.cumsum([t['net_pnl'] for t in trades])
+        return pd.DataFrame(dict(
+            date=[t['close_date'] for t in trades],
+            pnl=[t['net_pnl'] for t in trades],
+            cumulative=cum,
+            is_liq=[t['is_liquidation'] for t in trades],
+        ))
 
 
-def main():
-    st.title("📊 Bitget Trading Analytics Dashboard")
-    st.markdown("### Analyze your USDT-M / USDC-M Futures trading performance")
-    st.markdown(
-        "**✅ Position-based P&L · Partial closes grouped correctly · "
-        "Funding fees included · Multi-file support**"
+# ═════════════════════════════════════════════════════════════════════
+# UI COMPONENTS
+# ═════════════════════════════════════════════════════════════════════
+
+def render_metrics(stats, currency='$'):
+    c1, c2, c3, c4, c5 = st.columns(5)
+    with c1:
+        st.metric("Positions", stats['trades'])
+    with c2:
+        icon = "🟢" if stats['win_rate'] >= 50 else "🔴"
+        st.metric("Win Rate", f"{icon} {stats['win_rate']:.1f}%")
+    with c3:
+        sign = '+' if stats['total_pnl'] >= 0 else ''
+        st.metric("Net P&L", f"{sign}{stats['total_pnl']:,.2f} {currency}")
+    with c4:
+        st.metric("Profit Factor", f"{stats['profit_factor']:.2f}")
+    with c5:
+        st.metric("Liquidations", stats['liqs'])
+
+
+def render_cumulative_chart(series, title="Cumulative P&L"):
+    if series.empty:
+        return
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=series['date'], y=series['cumulative'],
+        mode='lines', name='P&L',
+        line=dict(color='#00E5A0', width=2),
+        fill='tozeroy', fillcolor='rgba(0,229,160,0.08)',
+    ))
+    liqs = series[series['is_liq']]
+    if not liqs.empty:
+        fig.add_trace(go.Scatter(
+            x=liqs['date'], y=liqs['cumulative'],
+            mode='markers', name='Liquidation',
+            marker=dict(color='#F6465D', size=8, symbol='x'),
+        ))
+    fig.update_layout(
+        template='plotly_dark',
+        paper_bgcolor='#0D1117', plot_bgcolor='#0D1117',
+        height=360, margin=dict(l=0, r=0, t=30, b=0),
+        title=dict(text=title, font=dict(size=14, color='#8B949E')),
+        xaxis=dict(gridcolor='#21262D', showgrid=False),
+        yaxis=dict(gridcolor='#21262D', title='P&L'),
+        legend=dict(bgcolor='rgba(0,0,0,0)'),
+        hovermode='x unified',
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def render_symbol_bars(sym_stats, title="P&L by Symbol"):
+    if not sym_stats:
+        return
+    df = pd.DataFrame([
+        dict(symbol=s, pnl=d['pnl']) for s, d in sym_stats.items()
+    ]).sort_values('pnl', ascending=True)
+    colors = ['#00E5A0' if v >= 0 else '#F6465D' for v in df['pnl']]
+    fig = go.Figure(go.Bar(
+        y=df['symbol'], x=df['pnl'], orientation='h',
+        marker_color=colors,
+        text=[f"{v:+,.0f}" for v in df['pnl']],
+        textposition='outside', textfont=dict(size=11),
+    ))
+    fig.update_layout(
+        template='plotly_dark',
+        paper_bgcolor='#0D1117', plot_bgcolor='#0D1117',
+        height=max(280, len(df) * 28),
+        margin=dict(l=0, r=60, t=30, b=0),
+        title=dict(text=title, font=dict(size=14, color='#8B949E')),
+        xaxis=dict(gridcolor='#21262D', title='P&L'),
+        yaxis=dict(gridcolor='#21262D'),
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def render_positions_table(trades, market_filter=None):
+    if not trades:
+        st.info("No positions to display.")
+        return
+    data = trades if not market_filter else [t for t in trades if t['market'] == market_filter]
+    if not data:
+        st.info("No positions for this filter.")
+        return
+
+    df = pd.DataFrame(data)
+
+    # ── Filters ──
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        syms = ['All'] + sorted(df['symbol'].unique().tolist())
+        sel_sym = st.selectbox("Symbol", syms, key=f"sym_{market_filter}")
+    with c2:
+        sel_dir = st.selectbox("Direction", ['All', 'Long', 'Short'], key=f"dir_{market_filter}")
+    with c3:
+        sel_res = st.selectbox("Result", ['All', 'Win', 'Loss', 'Liquidation'], key=f"res_{market_filter}")
+    with c4:
+        sort_map = {
+            'Close date ↓': ('close_date', False),
+            'Close date ↑': ('close_date', True),
+            'P&L best ↓': ('net_pnl', False),
+            'P&L worst ↓': ('net_pnl', True),
+            'Holding longest ↓': ('holding_hours', False),
+            'Holding shortest ↓': ('holding_hours', True),
+        }
+        sel_sort = st.selectbox("Sort", list(sort_map.keys()), key=f"sort_{market_filter}")
+
+    if sel_sym != 'All':
+        df = df[df['symbol'] == sel_sym]
+    if sel_dir != 'All':
+        df = df[df['direction'] == sel_dir]
+    if sel_res == 'Win':
+        df = df[(df['is_win']) & (~df['is_liquidation'])]
+    elif sel_res == 'Loss':
+        df = df[(~df['is_win']) & (~df['is_liquidation'])]
+    elif sel_res == 'Liquidation':
+        df = df[df['is_liquidation']]
+
+    sort_col, asc = sort_map[sel_sort]
+    df = df.sort_values(sort_col, ascending=asc)
+
+    if df.empty:
+        st.info("No positions match filters.")
+        return
+
+    display = pd.DataFrame({
+        'Opened': df['open_date'].dt.strftime('%Y-%m-%d %H:%M'),
+        'Closed': df['close_date'].dt.strftime('%Y-%m-%d %H:%M'),
+        'Symbol': df['symbol'],
+        'Dir': df['direction'],
+        'Net P&L': df['net_pnl'].round(2),
+        'Funding': df['funding_fees'].round(4),
+        'Result': df.apply(
+            lambda r: '⚠️ LIQ' if r['is_liquidation'] else ('✅ Win' if r['is_win'] else '❌ Loss'), axis=1
+        ),
+        'Holding': df['holding_hours'].apply(lambda h: f"{h:.1f}h" if h > 0 else '—'),
+        'Fills': df['num_closes'].astype(int),
+    })
+
+    st.caption(f"{len(display)} of {len(data)} positions")
+
+    st.dataframe(
+        display, use_container_width=True, hide_index=True,
+        height=min(600, 38 + len(display) * 35),
+        column_config={
+            'Net P&L': st.column_config.NumberColumn('Net P&L', format="%.2f"),
+            'Funding': st.column_config.NumberColumn('Funding', format="%.4f"),
+            'Fills': st.column_config.NumberColumn('Fills', format="%d"),
+        },
     )
 
+    csv_out = df.to_csv(index=False)
+    st.download_button("📥 Download CSV", csv_out, "positions.csv", "text/csv", key=f"dl_{market_filter}")
+
+
+# ═════════════════════════════════════════════════════════════════════
+# MAIN
+# ═════════════════════════════════════════════════════════════════════
+
+def main():
+    st.markdown("""
+    <div style="display:flex; align-items:center; gap:12px; margin-bottom:4px;">
+        <span style="font-size:28px;">📊</span>
+        <span style="font-size:26px; font-weight:700; color:#E6EDF3;">Trading Dashboard</span>
+    </div>
+    <p style="color:#8B949E; margin-top:0; font-size:14px;">
+        Bitget Futures · Position-based P&L · Multi-account analysis
+    </p>
+    """, unsafe_allow_html=True)
+
     with st.sidebar:
-        st.header("📁 Upload Data")
-        st.markdown(
-            "Upload one or both Bitget CSV transaction exports. "
-            "The files will be merged automatically."
-        )
-
+        st.markdown("### 📁 Upload Data")
         uploaded_files = st.file_uploader(
-            "Upload Bitget CSV Export(s)",
-            type=['csv'],
-            accept_multiple_files=True,
-            help="You can upload both USDT-M and USDC-M transaction exports at once.",
+            "Bitget CSV Transaction Exports",
+            type=['csv'], accept_multiple_files=True,
+            help="Upload USDT-M and/or USDC-M transaction CSVs",
         )
-
         st.markdown("---")
-        st.markdown("### How It Works")
         st.markdown(
-            "- Opens and partial closes are **grouped into positions**\n"
-            "- Funding fees are included for each position's lifetime\n"
-            "- Trading fees (open + close) are subtracted\n"
-            "- Liquidations are tracked separately\n"
-            "- USDT-M and USDC-M files are merged if both uploaded"
+            "**How it works**\n\n"
+            "Opens & partial closes are grouped into positions. "
+            "P&L includes trading fees and funding fees."
         )
 
     if not uploaded_files:
-        st.info("👈 Upload your Bitget CSV file(s) to begin")
+        st.markdown("""
+        <div style="text-align:center; padding:80px 20px; color:#8B949E;">
+            <p style="font-size:48px; margin-bottom:16px;">📁</p>
+            <p style="font-size:18px;">Upload your Bitget CSV export(s) to get started</p>
+            <p style="font-size:14px; margin-top:8px;">
+                Supports USDT-M and USDC-M · Multiple files merged automatically
+            </p>
+        </div>
+        """, unsafe_allow_html=True)
         return
 
-    with st.spinner("Analyzing your trades..."):
+    with st.spinner("Analyzing positions..."):
         try:
-            dfs = []
-            file_names = []
-            for f in uploaded_files:
-                df = BitgetAnalyzer.load_csv(f)
-                dfs.append(df)
-                file_names.append(f.name)
-
-            combined_df = BitgetAnalyzer.merge_dataframes(dfs)
-            analyzer = BitgetAnalyzer(combined_df)
-            stats = analyzer.get_summary_stats()
-
+            dfs = [BitgetAnalyzer.load_csv(f) for f in uploaded_files]
+            combined = BitgetAnalyzer.merge_dataframes(dfs)
+            analyzer = BitgetAnalyzer(combined)
             if not analyzer.trades:
-                st.warning("No completed trades found in the uploaded data.")
+                st.warning("No completed positions found.")
                 return
-
-            market_info = ", ".join(
-                sorted(combined_df['Market'].unique())
-            )
-            st.success(
-                f"✅ **{len(analyzer.trades)} positions** analyzed from "
-                f"**{len(uploaded_files)} file(s)** ({market_info})"
-            )
-
         except Exception as e:
-            st.error(f"Error: {str(e)}")
+            st.error(f"Error: {e}")
             import traceback
             st.code(traceback.format_exc())
             return
 
-    # ── Summary metrics ──────────────────────────────────────────────
-    col1, col2, col3, col4 = st.columns(4)
+    markets = sorted(set(t['market'] for t in analyzer.trades))
+    has_both = len(markets) > 1
 
-    with col1:
-        st.metric("Total Positions", stats['total_trades'])
-        st.metric("Wins / Losses", f"{stats['winning_trades']} / {stats['losing_trades']}")
+    # ── Account comparison ──
+    if has_both:
+        st.markdown('<div class="dash-header">⚖️ Account Comparison</div>', unsafe_allow_html=True)
+        cols = st.columns(len(markets))
+        for i, m in enumerate(markets):
+            s = analyzer.stats(m)
+            if not s:
+                continue
+            currency = 'USDC' if 'USDC' in m else 'USDT'
+            pnl_color = '#00E5A0' if s['total_pnl'] >= 0 else '#F6465D'
+            sign = '+' if s['total_pnl'] >= 0 else ''
+            with cols[i]:
+                st.markdown(f"""
+                <div class="account-card">
+                    <h3 style="color:#8B949E;">{m}</h3>
+                    <div class="big-pnl" style="color:{pnl_color};">{sign}{s['total_pnl']:,.2f} {currency}</div>
+                    <div style="margin-top:16px; display:grid; grid-template-columns:1fr 1fr; gap:8px; font-size:14px;">
+                        <div><span style="color:#8B949E;">Positions</span><br><b>{s['trades']}</b></div>
+                        <div><span style="color:#8B949E;">Win Rate</span><br><b>{s['win_rate']:.1f}%</b></div>
+                        <div><span style="color:#8B949E;">Profit Factor</span><br><b>{s['profit_factor']:.2f}</b></div>
+                        <div><span style="color:#8B949E;">Liquidations</span><br><b style="color:#F6465D;">{s['liqs']}</b></div>
+                        <div><span style="color:#8B949E;">Trading Fees</span><br><b>{s['trading_fees']:,.2f}</b></div>
+                        <div><span style="color:#8B949E;">Funding Fees</span><br><b>{s['funding_fees']:,.2f}</b></div>
+                        <div><span style="color:#8B949E;">Best Trade</span><br><b style="color:#00E5A0;">+{s['best']['net_pnl']:,.2f}</b></div>
+                        <div><span style="color:#8B949E;">Worst Trade</span><br><b style="color:#F6465D;">{s['worst']['net_pnl']:,.2f}</b></div>
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
 
-    with col2:
-        win_icon = "🟢" if stats['win_rate'] >= 50 else "🔴"
-        st.metric("Win Rate", f"{win_icon} {stats['win_rate']:.1f}%")
-        st.metric("Profit Factor", f"{stats['profit_factor']:.2f}")
+        ts = analyzer.stats()
+        st.markdown(f"""
+        <div style="text-align:center; padding:12px; background:#161B22; border:1px solid #21262D; border-radius:12px; margin-bottom:20px;">
+            <span style="color:#8B949E; font-size:14px;">Combined Net P&L</span><br>
+            <span style="font-size:28px; font-weight:700; color:{'#00E5A0' if ts['total_pnl']>=0 else '#F6465D'};">
+                {'+' if ts['total_pnl']>=0 else ''}{ts['total_pnl']:,.2f}
+            </span>
+            <span style="color:#8B949E;"> across {ts['trades']} positions</span>
+        </div>
+        """, unsafe_allow_html=True)
 
-    with col3:
-        pnl_icon = "🟢" if stats['total_pnl'] >= 0 else "🔴"
-        st.metric("Total Net P&L", f"{pnl_icon} ${stats['total_pnl']:.2f}")
-        st.metric("Max Drawdown", f"${stats['max_drawdown']:.2f}")
+    # ── Tabs ──
+    tab_labels = (markets + ['Combined']) if has_both else markets
+    tabs = st.tabs(tab_labels)
 
-    with col4:
-        st.metric("Liquidations", stats['liquidation_trades'])
-        st.metric("Expectancy", f"${stats['expectancy']:.2f}")
+    for idx, label in enumerate(tab_labels):
+        with tabs[idx]:
+            mf = None if label == 'Combined' else label
+            s = analyzer.stats(mf)
+            if not s:
+                st.info("No data.")
+                continue
+            currency = 'USDC' if mf and 'USDC' in mf else ('USDT' if mf and 'USDT' in mf else '$')
 
-    # ── Cumulative P&L chart ─────────────────────────────────────────
-    ts_data = analyzer.get_time_series_data()
-    if not ts_data.empty:
-        st.subheader("📈 Cumulative P&L")
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(
-            x=ts_data['date'],
-            y=ts_data['cumulative_pnl'],
-            mode='lines+markers',
-            name='Cumulative P&L',
-            line=dict(color='#00cc96', width=2),
-            marker=dict(size=4),
-        ))
-        # Mark liquidations
-        liq_data = ts_data[ts_data['is_liquidation'] == 1]
-        if not liq_data.empty:
-            fig.add_trace(go.Scatter(
-                x=liq_data['date'],
-                y=liq_data['cumulative_pnl'],
-                mode='markers',
-                name='Liquidation',
-                marker=dict(color='red', size=10, symbol='x'),
-            ))
-        fig.update_layout(
-            xaxis_title='Date',
-            yaxis_title='Cumulative P&L ($)',
-            template='plotly_dark',
-            height=400,
-        )
-        st.plotly_chart(fig, use_container_width=True)
+            render_metrics(s, currency)
 
-    # ── Fee breakdown ────────────────────────────────────────────────
-    with st.expander("💰 Fee Breakdown"):
-        col1, col2, col3, col4 = st.columns(4)
-        with col1:
-            st.metric("Open Fees", f"${stats['total_open_fees']:.4f}")
-        with col2:
-            st.metric("Close Fees", f"${stats['total_close_fees']:.4f}")
-        with col3:
-            st.metric("Total Trading Fees", f"${stats['total_trading_fees']:.4f}")
-        with col4:
-            st.metric("Total Funding Fees", f"${stats['total_funding_fees']:.4f}")
+            series = analyzer.cumulative_series(mf)
+            render_cumulative_chart(series, f"Cumulative P&L ({label})")
 
-    # ── Advanced stats ───────────────────────────────────────────────
-    with st.expander("📐 Advanced Stats"):
-        col1, col2, col3, col4 = st.columns(4)
-        with col1:
-            st.metric("Avg Win", f"${stats['avg_win']:.2f}")
-        with col2:
-            st.metric("Avg Loss", f"${stats['avg_loss']:.2f}")
-        with col3:
-            st.metric("Sharpe Ratio", f"{stats['sharpe_ratio']:.2f}")
-        with col4:
-            st.metric("Avg Holding", f"{stats['avg_holding_hours']:.1f}h")
+            with st.expander("📐 Detailed Stats & Fee Breakdown"):
+                c1, c2, c3, c4 = st.columns(4)
+                with c1:
+                    st.metric("Avg Win", f"{s['avg_win']:,.2f}")
+                    st.metric("Trading Fees", f"{s['trading_fees']:,.2f}")
+                with c2:
+                    st.metric("Avg Loss", f"{s['avg_loss']:,.2f}")
+                    st.metric("Funding Fees", f"{s['funding_fees']:,.2f}")
+                with c3:
+                    st.metric("Sharpe Ratio", f"{s['sharpe']:.2f}")
+                    st.metric("Max Drawdown", f"{s['max_drawdown']:,.2f}")
+                with c4:
+                    st.metric("Expectancy", f"{s['expectancy']:,.2f}")
+                    st.metric("Avg Holding", f"{s['avg_holding']:.1f}h")
+                st.markdown(
+                    f"**Best:** {s['best']['symbol']} → "
+                    f"**+{s['best']['net_pnl']:,.2f}** &nbsp;|&nbsp; "
+                    f"**Worst:** {s['worst']['symbol']} → "
+                    f"**{s['worst']['net_pnl']:,.2f}**"
+                )
 
-        if stats['best_trade']:
-            st.markdown(
-                f"**Best trade:** {stats['best_trade']['symbol']} → "
-                f"${stats['best_trade']['net_pnl']:.2f}"
-            )
-        if stats['worst_trade']:
-            st.markdown(
-                f"**Worst trade:** {stats['worst_trade']['symbol']} → "
-                f"${stats['worst_trade']['net_pnl']:.2f}"
-            )
+            st.markdown('<div class="dash-header">📊 Performance by Symbol</div>', unsafe_allow_html=True)
+            sym = analyzer.symbol_breakdown(mf)
+            if sym:
+                sym_df = pd.DataFrame([
+                    dict(Symbol=k, Positions=v['trades'], Wins=v['wins'],
+                         WinRate=round(v['win_rate'],1), PnL=round(v['pnl'],2),
+                         Funding=round(v['funding'],2), Liqs=v['liqs'])
+                    for k, v in sym.items()
+                ]).sort_values('PnL', ascending=False)
+                st.dataframe(sym_df, use_container_width=True, hide_index=True,
+                    column_config={
+                        'WinRate': st.column_config.NumberColumn('Win %', format="%.1f%%"),
+                        'PnL': st.column_config.NumberColumn('P&L', format="%.2f"),
+                        'Funding': st.column_config.NumberColumn('Funding', format="%.2f"),
+                    })
+                render_symbol_bars(sym, f"P&L by Symbol ({label})")
 
-    # ── Symbol breakdown ─────────────────────────────────────────────
-    st.subheader("📊 Performance by Symbol")
-    symbol_stats = analyzer.get_symbol_breakdown()
-    if symbol_stats:
-        symbol_df = pd.DataFrame([
-            {
-                'Symbol': sym,
-                'Market': data['market'],
-                'Positions': data['trades'],
-                'Wins': data['wins'],
-                'Win Rate': f"{data['win_rate']:.1f}%",
-                'Total P&L': round(data['total_pnl'], 2),
-                'Avg P&L': round(data['avg_pnl'], 2),
-                'Funding Fees': round(data['total_funding_fees'], 4),
-                'Liquidations': data['liquidations'],
-            }
-            for sym, data in symbol_stats.items()
-        ]).sort_values('Total P&L', ascending=False)
-
-        st.dataframe(symbol_df, use_container_width=True, hide_index=True)
-
-        # P&L by symbol bar chart
-        fig_bar = go.Figure()
-        colors = ['#00cc96' if v >= 0 else '#ef553b' for v in symbol_df['Total P&L']]
-        fig_bar.add_trace(go.Bar(
-            x=symbol_df['Symbol'],
-            y=symbol_df['Total P&L'],
-            marker_color=colors,
-            text=[f"${v:.2f}" for v in symbol_df['Total P&L']],
-            textposition='outside',
-        ))
-        fig_bar.update_layout(
-            title='P&L by Symbol',
-            yaxis_title='P&L ($)',
-            template='plotly_dark',
-            height=350,
-        )
-        st.plotly_chart(fig_bar, use_container_width=True)
-
-    # ── All positions ────────────────────────────────────────────────
-    st.subheader("📋 All Positions")
-    trades_df = analyzer.get_trades_df()
-    if not trades_df.empty:
-        display_df = trades_df.copy()
-        display_df['open_date'] = pd.to_datetime(display_df['open_date']).dt.strftime('%Y-%m-%d %H:%M')
-        display_df['close_date'] = pd.to_datetime(display_df['close_date']).dt.strftime('%Y-%m-%d %H:%M')
-        display_df['net_pnl_fmt'] = display_df['net_pnl'].apply(lambda x: f"${x:.2f}")
-        display_df['funding_fmt'] = display_df['funding_fees'].apply(lambda x: f"${x:.4f}")
-        display_df['result'] = display_df.apply(
-            lambda r: "⚠️ LIQUIDATION" if r['is_liquidation'] else ("✅ Win" if r['is_win'] else "❌ Loss"),
-            axis=1,
-        )
-        display_df['holding'] = display_df['holding_hours'].apply(
-            lambda x: f"{x:.1f}h" if x > 0 else "Instant"
-        )
-
-        st.dataframe(
-            display_df[[
-                'open_date', 'close_date', 'symbol', 'market', 'direction',
-                'net_pnl_fmt', 'funding_fmt', 'result', 'holding', 'num_closes',
-            ]].rename(columns={
-                'open_date': 'Opened',
-                'close_date': 'Closed',
-                'symbol': 'Symbol',
-                'market': 'Market',
-                'direction': 'Direction',
-                'net_pnl_fmt': 'Net P&L',
-                'funding_fmt': 'Funding',
-                'result': 'Result',
-                'holding': 'Holding',
-                'num_closes': 'Fills',
-            }),
-            use_container_width=True,
-            hide_index=True,
-        )
-
-        # Download
-        csv = trades_df.to_csv(index=False)
-        b64 = base64.b64encode(csv.encode()).decode()
-        st.markdown(
-            f'<a href="data:file/csv;base64,{b64}" download="bitget_positions.csv">'
-            f'📥 Download Positions CSV</a>',
-            unsafe_allow_html=True,
-        )
+            st.markdown('<div class="dash-header">📋 All Positions</div>', unsafe_allow_html=True)
+            render_positions_table(analyzer.trades, mf)
 
 
 if __name__ == "__main__":
