@@ -10,6 +10,7 @@ import plotly.graph_objects as go
 import io
 import json
 import hashlib
+import re
 from datetime import datetime
 
 st.set_page_config(page_title="Trading Dashboard", page_icon="📊", layout="wide")
