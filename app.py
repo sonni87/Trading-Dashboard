@@ -290,10 +290,73 @@ def restore_datetime_fields(rows, fields):
     return out
 
 
-class StoredBitgetAnalyzer(BitgetAnalyzer):
+class StoredBitgetAnalyzer:
     def __init__(self, trades):
         self.df = pd.DataFrame()
         self.trades = restore_datetime_fields(trades, ["open_date", "close_date"])
+        self.trades.sort(key=lambda x: x.get("close_date") if pd.notna(x.get("close_date")) else pd.Timestamp.min)
+
+    def stats(self, mf=None):
+        tr = [t for t in self.trades if not mf or t.get('market') == mf]
+        if not tr:
+            return None
+        n = len(tr)
+        w = sum(1 for t in tr if t.get('is_win'))
+        l = n - w
+        lq = sum(1 for t in tr if t.get('is_liquidation'))
+        tp = sum(float(t.get('net_pnl', 0) or 0) for t in tr)
+        gp = sum(float(t.get('net_pnl', 0) or 0) for t in tr if float(t.get('net_pnl', 0) or 0) > 0)
+        gl = abs(sum(float(t.get('net_pnl', 0) or 0) for t in tr if float(t.get('net_pnl', 0) or 0) < 0))
+        pf = gp / gl if gl > 0 else float('inf')
+        ff = sum(float(t.get('funding_fees', 0) or 0) for t in tr)
+        tf = sum(float(t.get('open_fees', 0) or 0) + float(t.get('close_fees', 0) or 0) for t in tr)
+        rets = [float(t.get('net_pnl', 0) or 0) for t in tr]
+        sh = (np.mean(rets) / np.std(rets)) * np.sqrt(252) if np.std(rets) > 0 else 0
+        cum = np.cumsum(rets)
+        dd = cum - np.maximum.accumulate(cum)
+        mdd = float(np.min(dd)) if len(dd) > 0 else 0
+        b = max(tr, key=lambda x: float(x.get('net_pnl', 0) or 0))
+        wo = min(tr, key=lambda x: float(x.get('net_pnl', 0) or 0))
+        hh = [float(t.get('holding_hours', 0) or 0) for t in tr if float(t.get('holding_hours', 0) or 0) > 0]
+        return dict(
+            trades=n, wins=w, losses=l, liqs=lq, win_rate=w/n*100,
+            total_pnl=tp, gross_profit=gp, gross_loss=gl, profit_factor=pf,
+            avg_win=gp/w if w else 0, avg_loss=-gl/l if l else 0,
+            funding_fees=ff, trading_fees=tf, sharpe=sh, max_drawdown=mdd,
+            expectancy=tp/n, avg_holding=np.mean(hh) if hh else 0,
+            best=b, worst=wo
+        )
+
+    def symbol_breakdown(self, mf=None):
+        tr = [t for t in self.trades if not mf or t.get('market') == mf]
+        out = {}
+        for t in tr:
+            s = t.get('symbol', '')
+            if s not in out:
+                out[s] = dict(trades=0, wins=0, pnl=0, funding=0, liqs=0, market=t.get('market', ''))
+            out[s]['trades'] += 1
+            if t.get('is_win'):
+                out[s]['wins'] += 1
+            out[s]['pnl'] += float(t.get('net_pnl', 0) or 0)
+            out[s]['funding'] += float(t.get('funding_fees', 0) or 0)
+            if t.get('is_liquidation'):
+                out[s]['liqs'] += 1
+        for s in out:
+            out[s]['win_rate'] = out[s]['wins'] / out[s]['trades'] * 100 if out[s]['trades'] else 0
+        return out
+
+    def cumulative(self, mf=None):
+        tr = [t for t in self.trades if not mf or t.get('market') == mf]
+        if not tr:
+            return pd.DataFrame()
+        rets = [float(t.get('net_pnl', 0) or 0) for t in tr]
+        cum = np.cumsum(rets)
+        return pd.DataFrame(dict(
+            date=[t.get('close_date') for t in tr],
+            pnl=rets,
+            cumulative=cum,
+            is_liq=[bool(t.get('is_liquidation')) for t in tr]
+        ))
 
 
 class StoredTradeRepublicAnalyzer:
