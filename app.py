@@ -303,6 +303,7 @@ class TradeRepublicAnalyzer:
         self.unmatched_closures = []
         self.lots_by_key = {}
         self.meta_by_key = {}
+        self.underlying_by_key = self._build_underlying_map()
         self.analyze()
 
     @staticmethod
@@ -349,6 +350,66 @@ class TradeRepublicAnalyzer:
         except Exception:
             return 0.0
 
+
+    @staticmethod
+    def _extract_underlying_from_description(description):
+        """Extract the underlying from Trade Republic derivative descriptions.
+
+        Examples:
+        - "Buy trade DE... Open End Turbo auf CROWDSTRIKE HLD. DL-,0005, quantity: 1250"
+          -> "CROWDSTRIKE HLD. DL-,0005"
+        - "Sell trade DE... Best Turbo auf Gold, quantity: 15"
+          -> "Gold"
+
+        Trade Republic's derivative display name is often only "Long 1.987 $".
+        The underlying is usually only available in the description field, so we
+        build a symbol -> underlying map from all rows first and reuse it.
+        """
+        if pd.isna(description):
+            return ''
+        desc = str(description).strip()
+        if not desc:
+            return ''
+
+        # Prefer the phrase after " auf " and before the quantity suffix.
+        match = re.search(r'\bauf\s+(.+?)(?:,\s*quantity:|$)', desc, flags=re.IGNORECASE)
+        if match:
+            underlying = match.group(1).strip()
+            underlying = re.sub(r'\s+', ' ', underlying)
+            return underlying
+
+        return ''
+
+    def _build_underlying_map(self):
+        out = {}
+        if 'description' not in self.df.columns:
+            return out
+
+        candidates = self.df.copy()
+        candidates['symbol'] = candidates['symbol'].fillna('').astype(str).str.strip()
+        candidates['description'] = candidates['description'].fillna('').astype(str)
+
+        for symbol, group in candidates[candidates['symbol'] != ''].groupby('symbol'):
+            found = []
+            for desc in group['description']:
+                underlying = self._extract_underlying_from_description(desc)
+                if underlying:
+                    found.append(underlying)
+            if found:
+                # Most frequent cleaned value wins.
+                out[symbol] = pd.Series(found).mode().iloc[0]
+
+        # A small manual fallback map for older rows where the CSV contained no description.
+        # The app still works without these; they will simply display "—".
+        manual = {
+            # Add manually verified ISIN -> underlying values here if Trade Republic
+            # did not export a description for old trades.
+            # 'DE000EXAMPLE0': 'Example underlying',
+        }
+        out.update({k: v for k, v in manual.items() if k not in out})
+        return out
+
+
     def _key(self, row):
         symbol = str(row.get('symbol', '') or '').strip()
         name = str(row.get('name', '') or '').strip()
@@ -361,10 +422,13 @@ class TradeRepublicAnalyzer:
 
     def _update_meta(self, key, row):
         if key not in self.meta_by_key:
+            symbol = str(row.get('symbol', '') or '').strip()
+            desc_underlying = self._extract_underlying_from_description(row.get('description', ''))
             self.meta_by_key[key] = dict(
-                symbol=str(row.get('symbol', '') or '').strip(),
+                symbol=symbol,
                 name=str(row.get('name', '') or '').strip(),
                 asset_class=str(row.get('asset_class', '') or '').strip(),
+                underlying=desc_underlying or self.underlying_by_key.get(symbol, ''),
             )
         else:
             m = self.meta_by_key[key]
@@ -372,6 +436,12 @@ class TradeRepublicAnalyzer:
                 val = str(row.get(field, '') or '').strip()
                 if val:
                     m[field] = val
+
+            symbol = str(row.get('symbol', '') or '').strip()
+            desc_underlying = self._extract_underlying_from_description(row.get('description', ''))
+            underlying = desc_underlying or self.underlying_by_key.get(symbol, '')
+            if underlying:
+                m['underlying'] = underlying
 
     def _lots(self, key):
         return self.lots_by_key.setdefault(key, [])
@@ -472,6 +542,7 @@ class TradeRepublicAnalyzer:
             name=meta.get('name') or row.get('name', ''),
             symbol=meta.get('symbol') or key,
             asset_class=meta.get('asset_class') or row.get('asset_class', ''),
+            underlying=meta.get('underlying', ''),
             shares_sold=total_matched,
             avg_buy_price=avg_buy_price,
             avg_sell_price=avg_sell_price,
@@ -592,50 +663,16 @@ class TradeRepublicAnalyzer:
         return events
 
     def _attach_same_day_tax_events(self):
-        """Attach standalone tax events to closed positions by date.
+        """Standalone tax events are displayed separately only.
 
-        The CSV often contains tax optimisation rows without symbol/ISIN. We therefore
-        cannot assign them perfectly to one position. The app shows:
-        - tax_on_sell: tax directly on the SELL/TILG row
-        - tax_events_same_day: all standalone tax events on that sell date
-        - tax_events_allocated: same-day tax event allocated to this row
-        - net_pnl_incl_tax_events: net_pnl plus allocated same-day tax event
+        Trade Republic often exports TAX_OPTIMIZATION rows without symbol/ISIN.
+        Assigning them to individual trades is misleading, so this function does
+        not allocate those rows to positions.
         """
-        if not self.closed_positions:
-            return
-
-        tax_events = self._tax_event_rows()
-        if tax_events.empty:
-            return
-
-        events_by_date = tax_events.groupby('trade_date')['tax_event_amount'].sum().to_dict()
-        rows_by_date = {}
-        for i, pos in enumerate(self.closed_positions):
-            d = self._trade_date(pos.get('last_sell'))
-            if d is not None:
-                rows_by_date.setdefault(d, []).append(i)
-
-        for d, idxs in rows_by_date.items():
-            same_day_total = float(events_by_date.get(d, 0.0) or 0.0)
-            if abs(same_day_total) <= self.EPS:
-                continue
-
-            # Prefer allocating tax adjustments to profitable closes because German taxes
-            # generally relate to taxable gains. Fall back to gross proceeds, then equal split.
-            positives = [max(float(self.closed_positions[i].get('realized_pnl', 0.0) or 0.0), 0.0) for i in idxs]
-            denom = sum(positives)
-            if denom <= self.EPS:
-                positives = [abs(float(self.closed_positions[i].get('avg_sell_price', 0.0) or 0.0) * float(self.closed_positions[i].get('shares_sold', 0.0) or 0.0)) for i in idxs]
-                denom = sum(positives)
-            if denom <= self.EPS:
-                positives = [1.0 for _ in idxs]
-                denom = float(len(idxs))
-
-            for weight, i in zip(positives, idxs):
-                alloc = same_day_total * (weight / denom)
-                self.closed_positions[i]['tax_events_same_day'] = same_day_total
-                self.closed_positions[i]['tax_events_allocated'] = alloc
-                self.closed_positions[i]['net_pnl_incl_tax_events'] = self.closed_positions[i].get('net_pnl', 0.0) + alloc
+        for pos in self.closed_positions:
+            pos['tax_events_same_day'] = 0.0
+            pos['tax_events_allocated'] = 0.0
+            pos['net_pnl_incl_tax_events'] = pos.get('net_pnl', 0.0)
 
     def tax_events_df(self):
         events = self._tax_event_rows()
@@ -744,6 +781,7 @@ class TradeRepublicAnalyzer:
                 name=meta.get('name') or key,
                 symbol=meta.get('symbol') or key,
                 asset_class=meta.get('asset_class', ''),
+                underlying=meta.get('underlying', ''),
                 shares=total_shares,
                 avg_cost=total_cost / total_shares if total_shares else 0,
                 total_cost=total_cost,
@@ -771,7 +809,7 @@ class TradeRepublicAnalyzer:
         standalone_tax_total = standalone_tax_events['tax_event_amount'].sum() if not standalone_tax_events.empty else 0.0
         total_taxes = abs(trading['tax'].sum()) + tilg_taxes + abs(self.df[self.df['type'].isin(['DIVIDEND', 'INTEREST_PAYMENT'])]['tax'].sum())
         realized_pnl = sum(p['realized_pnl'] for p in self.closed_positions)
-        net_pnl = sum(p.get('net_pnl_incl_tax_events', p['net_pnl']) for p in self.closed_positions)
+        net_pnl = sum(p['net_pnl'] for p in self.closed_positions)
         open_cost = sum(p['total_cost'] for p in self.open_positions)
         wins = sum(1 for p in self.closed_positions if p['net_pnl'] > 0)
         losses = len(self.closed_positions) - wins
@@ -893,6 +931,130 @@ def render_positions(trades, mf=None):
     st.download_button("📥 Download CSV", df.to_csv(index=False), "positions.csv", "text/csv", key=f"dl_{mf}")
 
 
+
+def make_tr_journal_id(prefix, row):
+    """Stable journal id for Trade Republic closed/open positions."""
+    symbol = str(row.get('symbol', row.get('Symbol', '')))
+    name = str(row.get('name', row.get('Name', '')))
+    asset_class = str(row.get('asset_class', row.get('Class', '')))
+    if prefix == "tr_open":
+        first_buy = str(row.get('first_buy', row.get('First Buy', '')))
+        shares = float(row.get('shares', row.get('Shares', 0)) or 0)
+        return hashlib.md5(f"{prefix}|{symbol}|{name}|{asset_class}|{first_buy}|{shares:.8f}".encode()).hexdigest()[:14]
+    first_buy = str(row.get('first_buy', row.get('Buy Date', '')))
+    last_sell = str(row.get('last_sell', row.get('Sell Date', '')))
+    pnl = float(row.get('net_pnl', row.get('Net P&L', 0)) or 0)
+    return hashlib.md5(f"{prefix}|{symbol}|{name}|{asset_class}|{first_buy}|{last_sell}|{pnl:.4f}".encode()).hexdigest()[:14]
+
+
+def render_tr_trade_journal_form(item, item_type="open"):
+    """Inline journal form for Trade Republic open or closed positions."""
+    tid = make_tr_journal_id("tr_open" if item_type == "open" else "tr_closed", item)
+    existing = JournalManager.get(tid)
+    title = "Open Trade Journal" if item_type == "open" else "Closed Trade Journal"
+
+    name = item.get('name', item.get('Name', ''))
+    symbol = item.get('symbol', item.get('Symbol', ''))
+    underlying = item.get('underlying', item.get('Underlying', '—'))
+    asset_class = item.get('asset_class', item.get('Class', ''))
+    shares = item.get('shares', item.get('shares_sold', item.get('Shares', item.get('Shares Sold', 0))))
+
+    st.markdown(f"#### 📓 {title}")
+    st.caption(f"{name} · {symbol} · {asset_class} · Underlying: {underlying} · Shares: {shares}")
+
+    with st.form(key=f"tr_journal_form_{tid}"):
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            strategy = st.selectbox(
+                "Strategy",
+                STRATEGIES,
+                index=STRATEGIES.index(existing.get('strategy', '')) if existing.get('strategy', '') in STRATEGIES else 0,
+                key=f"tr_strategy_{tid}"
+            )
+        with c2:
+            status = st.selectbox(
+                "Trade Status",
+                ["", "Watch", "Hold", "Add", "Reduce", "Exit planned", "Closed review"],
+                index=["", "Watch", "Hold", "Add", "Reduce", "Exit planned", "Closed review"].index(existing.get('status', '')) if existing.get('status', '') in ["", "Watch", "Hold", "Add", "Reduce", "Exit planned", "Closed review"] else 0,
+                key=f"tr_status_{tid}"
+            )
+        with c3:
+            conviction = st.slider("Conviction", 1, 5, existing.get('conviction', 3), key=f"tr_conviction_{tid}")
+
+        c4, c5, c6 = st.columns(3)
+        with c4:
+            entry_price = st.number_input("Entry / Avg price", value=float(existing.get('entry_price', item.get('avg_cost', item.get('avg_buy_price', 0)) or 0)), step=0.01, key=f"tr_entry_{tid}")
+        with c5:
+            target_price = st.number_input("Target price", value=float(existing.get('target_price', 0) or 0), step=0.01, key=f"tr_target_{tid}")
+        with c6:
+            stop_price = st.number_input("Stop / invalidation price", value=float(existing.get('stop_price', 0) or 0), step=0.01, key=f"tr_stop_{tid}")
+
+        setup = st.text_area("Setup / thesis", value=existing.get('setup_notes', ''), height=90, key=f"tr_setup_{tid}")
+        plan = st.text_area("Plan / next action", value=existing.get('plan_notes', ''), height=90, key=f"tr_plan_{tid}")
+        risk = st.text_area("Risk / invalidation", value=existing.get('risk_notes', ''), height=80, key=f"tr_risk_{tid}")
+
+        b1, b2 = st.columns([4, 1])
+        with b1:
+            submitted = st.form_submit_button("💾 Save journal", use_container_width=True)
+        with b2:
+            delete = st.form_submit_button("🗑️ Delete", use_container_width=True)
+
+    if submitted:
+        JournalManager.save(tid, dict(
+            source="Trade Republic",
+            item_type=item_type,
+            name=str(name),
+            symbol=str(symbol),
+            underlying=str(underlying),
+            asset_class=str(asset_class),
+            shares=float(shares or 0),
+            strategy=strategy,
+            status=status,
+            conviction=conviction,
+            entry_price=entry_price,
+            target_price=target_price,
+            stop_price=stop_price,
+            setup_notes=setup,
+            plan_notes=plan,
+            risk_notes=risk,
+            saved_at=str(datetime.now())
+        ))
+        st.success("Journal saved!")
+        st.rerun()
+
+    if delete:
+        JournalManager.delete(tid)
+        st.info("Journal deleted.")
+        st.rerun()
+
+
+def render_tr_journal_overview():
+    """Overview of Trade Republic journal entries."""
+    journal = st.session_state.get('journal', {})
+    tr_entries = {k: v for k, v in journal.items() if v.get('source') == 'Trade Republic'}
+    if not tr_entries:
+        st.info("Noch keine Trade-Republic-Journal-Einträge.")
+        return
+
+    rows = []
+    for jid, e in tr_entries.items():
+        rows.append(dict(
+            Type=e.get('item_type', ''),
+            Name=e.get('name', ''),
+            Symbol=e.get('symbol', ''),
+            Underlying=e.get('underlying', ''),
+            Status=e.get('status', ''),
+            Strategy=e.get('strategy', ''),
+            Conviction=e.get('conviction', ''),
+            Target=e.get('target_price', 0),
+            Stop=e.get('stop_price', 0),
+            Updated=e.get('saved_at', ''),
+            Notes=e.get('plan_notes', '')[:120],
+        ))
+    st.dataframe(pd.DataFrame(rows).sort_values('Updated', ascending=False), use_container_width=True, hide_index=True)
+
+
+
 # ═════════════════════════════════════════════════════════════════════
 # TRADE REPUBLIC UI
 # ═════════════════════════════════════════════════════════════════════
@@ -931,7 +1093,7 @@ def render_tr_tab(tr: TradeRepublicAnalyzer):
     tax_events_table = tr.tax_events_df()
     if not tax_events_table.empty:
         with st.expander("🧾 Standalone tax events / tax optimizations"):
-            st.caption("Signed values: positive = tax refund/optimization; negative = tax debit. These rows are allocated by sell date in 'Net incl. Tax Events'.")
+            st.caption("Signed values: positive = tax refund/optimization; negative = tax debit. These rows are shown separately and are not assigned to individual trades.")
             tax_disp = pd.DataFrame({
                 'Date': tax_events_table['date'].dt.strftime('%Y-%m-%d'),
                 'Type': tax_events_table['type'],
@@ -987,7 +1149,7 @@ def render_tr_tab(tr: TradeRepublicAnalyzer):
         with c1:
             closed_search = st.text_input(
                 "Search closed positions",
-                placeholder="Name, Symbol/ISIN oder Klasse suchen...",
+                placeholder="Name, Underlying, Symbol/ISIN oder Klasse suchen...",
                 key='tr_closed_search'
             )
         with c2:
@@ -1006,6 +1168,7 @@ def render_tr_tab(tr: TradeRepublicAnalyzer):
             searchable = (
                 cp_df['name'].fillna('').astype(str) + ' ' +
                 cp_df['symbol'].fillna('').astype(str) + ' ' +
+                cp_df.get('underlying', pd.Series('', index=cp_df.index)).fillna('').astype(str) + ' ' +
                 cp_df['asset_class'].fillna('').astype(str) + ' ' +
                 cp_df.get('close_type', pd.Series('', index=cp_df.index)).fillna('').astype(str)
             ).str.lower()
@@ -1018,16 +1181,13 @@ def render_tr_tab(tr: TradeRepublicAnalyzer):
             disp_cp = pd.DataFrame({
                 'Buy Date': cp_df['first_buy'].dt.strftime('%Y-%m-%d'),
                 'Sell Date': cp_df['last_sell'].dt.strftime('%Y-%m-%d'),
-                'Name': cp_df['name'], 'Symbol': cp_df['symbol'], 'Class': cp_df['asset_class'],
+                'Name': cp_df['name'], 'Underlying': cp_df.get('underlying', pd.Series('', index=cp_df.index)).replace('', '—'), 'Symbol': cp_df['symbol'], 'Class': cp_df['asset_class'],
                 'Shares Sold': cp_df['shares_sold'].round(4),
                 'Avg Buy': cp_df['avg_buy_price'].round(2), 'Avg Sell': cp_df['avg_sell_price'].round(2),
                 'Realized P&L': cp_df['realized_pnl'].round(2), 'Fees': cp_df['fees'].round(2),
-                'Tax on Sell': cp_df.get('tax_on_sell', pd.Series(0.0, index=cp_df.index)).round(2),
-                'Tax Events same day': cp_df.get('tax_events_same_day', pd.Series(0.0, index=cp_df.index)).round(2),
-                'Tax Events allocated': cp_df.get('tax_events_allocated', pd.Series(0.0, index=cp_df.index)).round(2),
+                'Tax': cp_df['taxes'].round(2),
                 'Net P&L': cp_df['net_pnl'].round(2),
-                'Net incl. Tax Events': cp_df.get('net_pnl_incl_tax_events', cp_df['net_pnl']).round(2),
-                'Result': cp_df.get('net_pnl_incl_tax_events', cp_df['net_pnl']).apply(lambda x: '✅' if x > 0 else '❌'),
+                'Result': cp_df['net_pnl'].apply(lambda x: '✅' if x > 0 else '❌'),
                 'How': cp_df.get('close_type', pd.Series(['SELL']*len(cp_df))).map(
                     {'SELL': '💰 Sold', 'KNOCKOUT': '💥 KO', 'TRANSFER': '📤 Transfer'}).fillna('💰 Sold'),
             })
@@ -1037,11 +1197,8 @@ def render_tr_tab(tr: TradeRepublicAnalyzer):
                 column_config={
                     'Realized P&L': st.column_config.NumberColumn('Realized', format="%.2f"),
                     'Net P&L': st.column_config.NumberColumn('Net direct', format="%.2f"),
-                    'Net incl. Tax Events': st.column_config.NumberColumn('Net incl. Tax Events', format="%.2f"),
                     'Fees': st.column_config.NumberColumn('Fees', format="%.2f"),
-                    'Tax on Sell': st.column_config.NumberColumn('Tax on Sell', format="%+.2f"),
-                    'Tax Events same day': st.column_config.NumberColumn('Tax Events same day', format="%+.2f"),
-                    'Tax Events allocated': st.column_config.NumberColumn('Tax Events allocated', format="%+.2f"),
+                    'Tax': st.column_config.NumberColumn('Tax', format="%.2f"),
                     'Avg Buy': st.column_config.NumberColumn('Avg Buy', format="%.2f"),
                     'Avg Sell': st.column_config.NumberColumn('Avg Sell', format="%.2f"),
                 })
@@ -1052,6 +1209,21 @@ def render_tr_tab(tr: TradeRepublicAnalyzer):
                 "text/csv",
                 key="tr_closed_download"
             )
+
+
+            with st.expander("📓 Journal for closed Trade Republic positions"):
+                if not cp_df.empty:
+                    choices = []
+                    rows = cp_df.to_dict("records")
+                    for idx, row in enumerate(rows):
+                        sell_date = row.get('last_sell')
+                        sell_txt = sell_date.strftime('%Y-%m-%d') if hasattr(sell_date, 'strftime') else str(sell_date)
+                        pnl = row.get('net_pnl', 0)
+                        choices.append((f"{sell_txt} | {row.get('name','')} | {row.get('symbol','')} | {pnl:+.2f} €", idx))
+                    selected = st.selectbox("Select closed trade", [c[0] for c in choices], key="tr_closed_journal_select")
+                    selected_idx = next(c[1] for c in choices if c[0] == selected)
+                    render_tr_trade_journal_form(rows[selected_idx], item_type="closed")
+
 
     # Open positions
     if tr.open_positions:
@@ -1084,6 +1256,7 @@ def render_tr_tab(tr: TradeRepublicAnalyzer):
             searchable = (
                 op_df['name'].fillna('').astype(str) + ' ' +
                 op_df['symbol'].fillna('').astype(str) + ' ' +
+                op_df.get('underlying', pd.Series('', index=op_df.index)).fillna('').astype(str) + ' ' +
                 op_df['asset_class'].fillna('').astype(str)
             ).str.lower()
             op_df = op_df[searchable.str.contains(re.escape(q), na=False)]
@@ -1092,7 +1265,7 @@ def render_tr_tab(tr: TradeRepublicAnalyzer):
         disp_op = pd.DataFrame({
             'First Buy': op_df['first_buy'].dt.strftime('%Y-%m-%d'),
             'Last Buy': op_df['last_buy'].dt.strftime('%Y-%m-%d') if 'last_buy' in op_df else op_df['first_buy'].dt.strftime('%Y-%m-%d'),
-            'Name': op_df['name'], 'Symbol': op_df['symbol'], 'Class': op_df['asset_class'],
+            'Name': op_df['name'], 'Underlying': op_df.get('underlying', pd.Series('', index=op_df.index)).replace('', '—'), 'Symbol': op_df['symbol'], 'Class': op_df['asset_class'],
             'Shares': op_df['shares'].round(4), 'Avg Cost': op_df['avg_cost'].round(2),
             'Total Invested': op_df['total_cost'].round(2),
             'Lots': op_df['num_lots'].astype(int) if 'num_lots' in op_df else 1,
@@ -1109,6 +1282,23 @@ def render_tr_tab(tr: TradeRepublicAnalyzer):
             "text/csv",
             key="tr_open_download"
         )
+
+
+        with st.expander("📓 Journal for open Trade Republic positions", expanded=True):
+            if not op_df.empty:
+                choices = []
+                rows = op_df.to_dict("records")
+                for idx, row in enumerate(rows):
+                    first_buy = row.get('first_buy')
+                    first_txt = first_buy.strftime('%Y-%m-%d') if hasattr(first_buy, 'strftime') else str(first_buy)
+                    choices.append((f"{row.get('name','')} | {row.get('symbol','')} | {row.get('asset_class','')} | since {first_txt}", idx))
+                selected = st.selectbox("Select open position", [c[0] for c in choices], key="tr_open_journal_select")
+                selected_idx = next(c[1] for c in choices if c[0] == selected)
+                render_tr_trade_journal_form(rows[selected_idx], item_type="open")
+
+    st.markdown('<div class="dash-header">📒 Trade Republic Journal Overview</div>', unsafe_allow_html=True)
+    render_tr_journal_overview()
+
 
     # Dividend & interest timeline
     divs = tr.df[tr.df['type'] == 'DIVIDEND']
@@ -1230,10 +1420,6 @@ def main():
         st.caption(f"{j_count} entries")
         if j_count > 0:
             st.download_button("📥 Export Journal", JournalManager.export_json(), "journal.json", "application/json", key="sj_exp")
-        j_imp = st.file_uploader("Import Journal", type=['json'], key="sj_imp")
-        if j_imp:
-            try: JournalManager.import_json(j_imp.getvalue().decode('utf-8')); st.rerun()
-            except: pass
 
     has_bitget = bitget_files and len(bitget_files) > 0
     has_tr = tr_file is not None
