@@ -10,6 +10,7 @@ import plotly.graph_objects as go
 import io
 import json
 import hashlib
+from pathlib import Path
 import re
 from datetime import datetime
 
@@ -88,6 +89,29 @@ textarea, input[type="text"], input[type="number"] {
 .tag-strategy { background: #1F3A2F; color: #00E5A0; }
 .tag-mistake { background: #3A1F1F; color: #F6465D; }
 .tag-emotion { background: #1F2D3A; color: #58A6FF; }
+
+.tr-summary-card {
+    background: #161B22;
+    border: 1px solid #21262D;
+    border-radius: 14px;
+    padding: 22px 24px;
+    min-height: 112px;
+}
+.tr-summary-card .label {
+    color: #9DA5AE;
+    font-size: 13px;
+    font-weight: 500;
+    margin-bottom: 14px;
+}
+.tr-summary-card .value {
+    font-size: 24px;
+    font-weight: 700;
+    color: #E6EDF3;
+}
+.tr-summary-card.pnl-positive .value { color: #00E5A0; }
+.tr-summary-card.pnl-negative .value { color: #F6465D; }
+.tr-summary-card.win .value { color: #00E5A0; }
+
 </style>
 """, unsafe_allow_html=True)
 
@@ -114,10 +138,14 @@ class JournalManager:
     def get(tid): return st.session_state.journal.get(tid, {})
 
     @staticmethod
-    def save(tid, entry): st.session_state.journal[tid] = entry
+    def save(tid, entry):
+        st.session_state.journal[tid] = entry
+        payload = LocalStore.load(); payload['journal'] = st.session_state.journal; LocalStore.save(payload)
 
     @staticmethod
-    def delete(tid): st.session_state.journal.pop(tid, None)
+    def delete(tid):
+        st.session_state.journal.pop(tid, None)
+        payload = LocalStore.load(); payload['journal'] = st.session_state.journal; LocalStore.save(payload)
 
     @staticmethod
     def export_json(): return json.dumps(st.session_state.journal, indent=2, default=str)
@@ -126,6 +154,7 @@ class JournalManager:
     def import_json(content):
         data = json.loads(content)
         st.session_state.journal.update(data)
+        payload = LocalStore.load(); payload['journal'] = st.session_state.journal; LocalStore.save(payload)
         return len(data)
 
     @staticmethod
@@ -135,6 +164,164 @@ class JournalManager:
 def make_trade_id(t):
     key = f"{t['symbol']}_{t['open_date']}_{t['close_date']}_{t['direction']}_{t['net_pnl']:.4f}"
     return hashlib.md5(key.encode()).hexdigest()[:12]
+
+
+# ═════════════════════════════════════════════════════════════════════
+# LOCAL PERSISTENCE — NORMALIZED DATA ONLY, NO RAW CSV FILES
+# ═════════════════════════════════════════════════════════════════════
+
+class LocalStore:
+    """Stores normalized trades/positions and journals locally.
+
+    Important: raw uploaded CSV files are not stored. Only processed summaries,
+    closed/open positions, income rows and journal entries are written to disk.
+    """
+
+    DATA_DIR = Path(".trading_dashboard_data")
+    STORE_FILE = DATA_DIR / "dashboard_store.json"
+
+    @staticmethod
+    def _json_default(obj):
+        if isinstance(obj, (pd.Timestamp, datetime)):
+            if pd.isna(obj):
+                return None
+            return obj.isoformat()
+        if isinstance(obj, np.integer):
+            return int(obj)
+        if isinstance(obj, np.floating):
+            return float(obj)
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        return str(obj)
+
+    @staticmethod
+    def load():
+        try:
+            if not LocalStore.STORE_FILE.exists():
+                return {}
+            with open(LocalStore.STORE_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+
+    @staticmethod
+    def save(payload):
+        LocalStore.DATA_DIR.mkdir(parents=True, exist_ok=True)
+        with open(LocalStore.STORE_FILE, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, ensure_ascii=False, default=LocalStore._json_default)
+
+    @staticmethod
+    def clear():
+        try:
+            if LocalStore.STORE_FILE.exists():
+                LocalStore.STORE_FILE.unlink()
+        except Exception:
+            pass
+
+    @staticmethod
+    def persist_from_session(bitget_analyzer=None, tr_analyzer=None):
+        payload = LocalStore.load()
+
+        payload["journal"] = st.session_state.get("journal", {})
+
+        if bitget_analyzer is not None:
+            bitget_trades = []
+            for t in bitget_analyzer.trades:
+                row = dict(t)
+                bitget_trades.append(row)
+            payload["bitget"] = {
+                "updated_at": datetime.now().isoformat(),
+                "trades": bitget_trades,
+            }
+
+        if tr_analyzer is not None:
+            summary = tr_analyzer.summary()
+            asset_class = tr_analyzer.by_asset_class()
+
+            income_rows = []
+            if hasattr(tr_analyzer, "df") and isinstance(tr_analyzer.df, pd.DataFrame) and not tr_analyzer.df.empty:
+                for _, r in tr_analyzer.df[tr_analyzer.df["type"].isin(["DIVIDEND", "INTEREST_PAYMENT"])].iterrows():
+                    income_rows.append({
+                        "date": r.get("date"),
+                        "type": r.get("type"),
+                        "name": r.get("name"),
+                        "amount": r.get("amount", 0),
+                        "tax": r.get("tax", 0),
+                    })
+
+            payload["trade_republic"] = {
+                "updated_at": datetime.now().isoformat(),
+                "summary": summary,
+                "asset_class": asset_class,
+                "closed_positions": tr_analyzer.closed_positions,
+                "open_positions": tr_analyzer.open_positions,
+                "income_rows": income_rows,
+            }
+
+        LocalStore.save(payload)
+
+    @staticmethod
+    def restore_journal_to_session():
+        payload = LocalStore.load()
+        if "journal" in payload and isinstance(payload["journal"], dict):
+            if "journal" not in st.session_state or not st.session_state.journal:
+                st.session_state.journal = payload["journal"]
+
+    @staticmethod
+    def has_saved_data():
+        payload = LocalStore.load()
+        return bool(payload.get("bitget") or payload.get("trade_republic") or payload.get("journal"))
+
+
+def parse_saved_datetime(value):
+    if value in (None, "", "NaT", "nan"):
+        return pd.NaT
+    return pd.to_datetime(value, errors="coerce")
+
+
+def restore_datetime_fields(rows, fields):
+    out = []
+    for r in rows or []:
+        nr = dict(r)
+        for f in fields:
+            if f in nr:
+                nr[f] = parse_saved_datetime(nr[f])
+        out.append(nr)
+    return out
+
+
+class StoredBitgetAnalyzer(BitgetAnalyzer):
+    def __init__(self, trades):
+        self.df = pd.DataFrame()
+        self.trades = restore_datetime_fields(trades, ["open_date", "close_date"])
+
+
+class StoredTradeRepublicAnalyzer:
+    def __init__(self, payload):
+        self.closed_positions = restore_datetime_fields(payload.get("closed_positions", []), ["first_buy", "last_sell"])
+        self.open_positions = restore_datetime_fields(payload.get("open_positions", []), ["first_buy", "last_buy"])
+        self._summary = payload.get("summary", {})
+        self._asset_class = payload.get("asset_class", {})
+
+        income_rows = restore_datetime_fields(payload.get("income_rows", []), ["date"])
+        if income_rows:
+            self.df = pd.DataFrame(income_rows)
+        else:
+            self.df = pd.DataFrame(columns=["date", "type", "name", "amount", "tax"])
+
+        if "date" in self.df.columns:
+            self.df["date"] = pd.to_datetime(self.df["date"], errors="coerce")
+        for col in ["amount", "tax"]:
+            if col in self.df.columns:
+                self.df[col] = pd.to_numeric(self.df[col], errors="coerce").fillna(0)
+
+    def summary(self):
+        return self._summary
+
+    def by_asset_class(self):
+        return self._asset_class
+
+
 
 
 # ═════════════════════════════════════════════════════════════════════
@@ -932,6 +1119,23 @@ def render_positions(trades, mf=None):
 
 
 
+
+def safe_date_text(value):
+    """Format pandas/python dates safely; returns — for NaT/NaN/None."""
+    try:
+        if value is None or pd.isna(value):
+            return "—"
+    except Exception:
+        if value is None:
+            return "—"
+    try:
+        if hasattr(value, "strftime"):
+            return value.strftime("%Y-%m-%d")
+    except Exception:
+        return "—"
+    return str(value) if str(value) not in ("NaT", "nan", "None") else "—"
+
+
 def make_tr_journal_id(prefix, row):
     """Stable journal id for Trade Republic closed/open positions."""
     symbol = str(row.get('symbol', row.get('Symbol', '')))
@@ -1055,6 +1259,65 @@ def render_tr_journal_overview():
 
 
 
+
+def aggregate_closed_positions_for_display(cp_df):
+    """Aggregate FIFO closed-position rows for display only.
+
+    Partial sells with same symbol/ISIN, sell date, asset class and close type
+    are shown as one row. FIFO matching itself remains unchanged internally.
+    """
+    if cp_df is None or cp_df.empty:
+        return cp_df
+
+    df = cp_df.copy()
+
+    for col in ["first_buy", "last_sell"]:
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col], errors="coerce")
+
+    if "underlying" not in df.columns:
+        df["underlying"] = "—"
+    if "close_type" not in df.columns:
+        df["close_type"] = "SELL"
+
+    df["_sell_day"] = df["last_sell"].dt.strftime("%Y-%m-%d").fillna("—")
+
+    group_cols = ["symbol", "name", "asset_class", "underlying", "_sell_day", "close_type"]
+
+    def weighted_avg(group, value_col):
+        weights = pd.to_numeric(group.get("shares_sold", 0), errors="coerce").fillna(0).abs()
+        values = pd.to_numeric(group.get(value_col, 0), errors="coerce").fillna(0)
+        total_weight = weights.sum()
+        if total_weight == 0:
+            return float(values.mean()) if len(values) else 0.0
+        return float((values * weights).sum() / total_weight)
+
+    rows = []
+    for _, g in df.groupby(group_cols, dropna=False, sort=False):
+        rows.append(dict(
+            name=g["name"].iloc[0],
+            symbol=g["symbol"].iloc[0],
+            asset_class=g["asset_class"].iloc[0],
+            underlying=g["underlying"].iloc[0] if str(g["underlying"].iloc[0]).strip() else "—",
+            shares_sold=pd.to_numeric(g.get("shares_sold", 0), errors="coerce").fillna(0).sum(),
+            avg_buy_price=weighted_avg(g, "avg_buy_price"),
+            avg_sell_price=weighted_avg(g, "avg_sell_price"),
+            realized_pnl=pd.to_numeric(g.get("realized_pnl", 0), errors="coerce").fillna(0).sum(),
+            fees=pd.to_numeric(g.get("fees", 0), errors="coerce").fillna(0).sum(),
+            taxes=pd.to_numeric(g.get("taxes", 0), errors="coerce").fillna(0).sum(),
+            net_pnl=pd.to_numeric(g.get("net_pnl", 0), errors="coerce").fillna(0).sum(),
+            first_buy=g["first_buy"].min() if "first_buy" in g.columns else pd.NaT,
+            last_sell=g["last_sell"].max() if "last_sell" in g.columns else pd.NaT,
+            num_buys=pd.to_numeric(g.get("num_buys", 0), errors="coerce").fillna(0).sum(),
+            num_sells=pd.to_numeric(g.get("num_sells", 0), errors="coerce").fillna(0).sum(),
+            close_type=g["close_type"].iloc[0],
+            rows_merged=len(g),
+        ))
+
+    return pd.DataFrame(rows)
+
+
+
 # ═════════════════════════════════════════════════════════════════════
 # TRADE REPUBLIC UI
 # ═════════════════════════════════════════════════════════════════════
@@ -1065,13 +1328,21 @@ def render_tr_tab(tr: TradeRepublicAnalyzer):
     st.markdown('<div class="dash-header">📈 Trade Republic Overview</div>', unsafe_allow_html=True)
     st.caption(s['date_range'])
 
-    # Key metrics
-    c1, c2, c3, c4, c5 = st.columns(5)
-    with c1: st.metric("Deposits", f"{s['deposits']:,.0f} €")
-    with c2: st.metric("Realized P&L", f"{s['realized_pnl']:+,.2f} €")
-    with c3: st.metric("Net P&L (after fees & tax)", f"{s['net_pnl']:+,.2f} €")
-    with c4: st.metric("Win Rate", f"{'🟢' if s['win_rate']>=50 else '🔴'} {s['win_rate']:.1f}%")
-    with c5: st.metric("Closed / Open", f"{s['closed_count']} / {s['open_count']}")
+    # Key metrics — custom cards to align with Bitget account cards
+    metric_cols = st.columns(5)
+    metric_data = [
+        ("Deposits", f"{s['deposits']:,.0f} €", ""),
+        ("Realized P&L", f"{s['realized_pnl']:+,.2f} €", "pnl-positive" if s['realized_pnl'] >= 0 else "pnl-negative"),
+        ("Net P&L", f"{s['net_pnl']:+,.2f} €", "pnl-positive" if s['net_pnl'] >= 0 else "pnl-negative"),
+        ("Win Rate", f"{s['win_rate']:.1f}%", "win" if s['win_rate'] >= 50 else "pnl-negative"),
+        ("Closed / Open", f"{s['closed_count']} / {s['open_count']}", ""),
+    ]
+    for col, (label, value, css_class) in zip(metric_cols, metric_data):
+        with col:
+            st.markdown(
+                f'<div class="tr-summary-card {css_class}"><div class="label">{label}</div><div class="value">{value}</div></div>',
+                unsafe_allow_html=True,
+            )
 
     if s.get('issues', 0) or s.get('unmatched', 0):
         with st.expander(f"⚠️ Import diagnostics ({s.get('issues', 0)} issues / {s.get('unmatched', 0)} unmatched closures)"):
@@ -1143,7 +1414,13 @@ def render_tr_tab(tr: TradeRepublicAnalyzer):
     # Closed positions table
     st.markdown('<div class="dash-header">📋 Closed Positions</div>', unsafe_allow_html=True)
     if tr.closed_positions:
-        cp_df = pd.DataFrame(tr.closed_positions)
+        cp_df_raw = pd.DataFrame(tr.closed_positions)
+        combine_same_day = st.toggle(
+            "Teilverkäufe am selben Verkaufstag zusammenfassen",
+            value=True,
+            help="Fasst FIFO-Teilpositionen mit gleichem Symbol/ISIN und gleichem Sell Date zu einer Tabellenzeile zusammen."
+        )
+        cp_df = aggregate_closed_positions_for_display(cp_df_raw) if combine_same_day else cp_df_raw.copy()
 
         c1, c2, c3, c4 = st.columns([2, 1, 1, 1])
         with c1:
@@ -1188,6 +1465,7 @@ def render_tr_tab(tr: TradeRepublicAnalyzer):
                 'Tax': cp_df['taxes'].round(2),
                 'Net P&L': cp_df['net_pnl'].round(2),
                 'Result': cp_df['net_pnl'].apply(lambda x: '✅' if x > 0 else '❌'),
+                'Parts': cp_df.get('rows_merged', pd.Series([1]*len(cp_df))).astype(int),
                 'How': cp_df.get('close_type', pd.Series(['SELL']*len(cp_df))).map(
                     {'SELL': '💰 Sold', 'KNOCKOUT': '💥 KO', 'TRANSFER': '📤 Transfer'}).fillna('💰 Sold'),
             })
@@ -1201,6 +1479,7 @@ def render_tr_tab(tr: TradeRepublicAnalyzer):
                     'Tax': st.column_config.NumberColumn('Tax', format="%.2f"),
                     'Avg Buy': st.column_config.NumberColumn('Avg Buy', format="%.2f"),
                     'Avg Sell': st.column_config.NumberColumn('Avg Sell', format="%.2f"),
+                    'Parts': st.column_config.NumberColumn('Parts', format="%d"),
                 })
             st.download_button(
                 "📥 Download closed TR positions CSV",
@@ -1217,7 +1496,7 @@ def render_tr_tab(tr: TradeRepublicAnalyzer):
                     rows = cp_df.to_dict("records")
                     for idx, row in enumerate(rows):
                         sell_date = row.get('last_sell')
-                        sell_txt = sell_date.strftime('%Y-%m-%d') if hasattr(sell_date, 'strftime') else str(sell_date)
+                        sell_txt = safe_date_text(sell_date)
                         pnl = row.get('net_pnl', 0)
                         choices.append((f"{sell_txt} | {row.get('name','')} | {row.get('symbol','')} | {pnl:+.2f} €", idx))
                     selected = st.selectbox("Select closed trade", [c[0] for c in choices], key="tr_closed_journal_select")
@@ -1290,14 +1569,11 @@ def render_tr_tab(tr: TradeRepublicAnalyzer):
                 rows = op_df.to_dict("records")
                 for idx, row in enumerate(rows):
                     first_buy = row.get('first_buy')
-                    first_txt = first_buy.strftime('%Y-%m-%d') if hasattr(first_buy, 'strftime') else str(first_buy)
+                    first_txt = safe_date_text(first_buy)
                     choices.append((f"{row.get('name','')} | {row.get('symbol','')} | {row.get('asset_class','')} | since {first_txt}", idx))
                 selected = st.selectbox("Select open position", [c[0] for c in choices], key="tr_open_journal_select")
                 selected_idx = next(c[1] for c in choices if c[0] == selected)
                 render_tr_trade_journal_form(rows[selected_idx], item_type="open")
-
-    st.markdown('<div class="dash-header">📒 Trade Republic Journal Overview</div>', unsafe_allow_html=True)
-    render_tr_journal_overview()
 
 
     # Dividend & interest timeline
@@ -1402,10 +1678,11 @@ def render_journal_tab(trades):
 
 def main():
     JournalManager.init()
+    LocalStore.restore_journal_to_session()
     st.markdown("""<div style="display:flex;align-items:center;gap:12px;margin-bottom:4px;">
         <span style="font-size:28px;">📊</span>
         <span style="font-size:26px;font-weight:700;color:#E6EDF3;">Trading Dashboard</span></div>
-    <p style="color:#9DA5AE;margin-top:0;font-size:14px;">Bitget Futures · Trade Republic · Trading Journal</p>""", unsafe_allow_html=True)
+    <p style="color:#9DA5AE;margin-top:0;font-size:14px;">Bitget Futures · Trade Republic · Crypto & TradFi Journals</p>""", unsafe_allow_html=True)
 
     with st.sidebar:
         st.markdown("### 📁 Bitget Data")
@@ -1415,24 +1692,45 @@ def main():
         tr_file = st.file_uploader("Trade Republic CSV Export", type=['csv'], key='tr_up',
             help="Transaktionsexport.csv from Trade Republic")
         st.markdown("---")
-        st.markdown("### 📓 Journal")
+        st.markdown("### 📓 Journals")
         j_count = JournalManager.count()
         st.caption(f"{j_count} entries")
         if j_count > 0:
             st.download_button("📥 Export Journal", JournalManager.export_json(), "journal.json", "application/json", key="sj_exp")
+        if LocalStore.has_saved_data():
+            st.caption("💾 Saved normalized data found")
+            if st.button("🧹 Clear saved data", key="clear_saved_data"):
+                LocalStore.clear()
+                st.session_state.journal = {}
+                st.success("Saved local data cleared.")
+                st.rerun()
 
     has_bitget = bitget_files and len(bitget_files) > 0
     has_tr = tr_file is not None
+    saved_payload = LocalStore.load()
 
-    if not has_bitget and not has_tr:
+    az = None
+    tr_analyzer = None
+
+    # Restore saved normalized data if no fresh CSV has been uploaded.
+    if not has_bitget and saved_payload.get("bitget", {}).get("trades"):
+        try:
+            az = StoredBitgetAnalyzer(saved_payload["bitget"]["trades"])
+        except Exception as e:
+            st.warning(f"Saved Bitget data could not be loaded: {e}")
+
+    if not has_tr and saved_payload.get("trade_republic"):
+        try:
+            tr_analyzer = StoredTradeRepublicAnalyzer(saved_payload["trade_republic"])
+        except Exception as e:
+            st.warning(f"Saved Trade Republic data could not be loaded: {e}")
+
+    if not has_bitget and not has_tr and az is None and tr_analyzer is None:
         st.markdown("""<div style="text-align:center;padding:80px 20px;color:#9DA5AE;">
             <p style="font-size:48px;margin-bottom:16px;">📁</p>
             <p style="font-size:18px;color:#D0D7DE;">Upload your trading data to get started</p>
             <p style="font-size:14px;margin-top:8px;">Bitget USDT-M · USDC-M · Legacy · Trade Republic</p></div>""", unsafe_allow_html=True)
         return
-
-    az = None
-    tr_analyzer = None
 
     # Load Bitget
     if has_bitget:
@@ -1454,6 +1752,15 @@ def main():
             tr_analyzer = TradeRepublicAnalyzer(TradeRepublicAnalyzer.load_csv(tr_file))
         except Exception as e:
             st.error(f"Trade Republic error: {e}")
+
+    # Persist normalized data after fresh uploads. Raw CSV files are not stored.
+    if has_bitget or has_tr:
+        try:
+            LocalStore.persist_from_session(az, tr_analyzer)
+            st.caption("💾 Normalized trades/positions and journal saved locally. Raw CSV files are not stored.")
+        except Exception as e:
+            st.warning(f"Could not save normalized local data: {e}")
+
 
     # Build tabs
     tab_labels = []
@@ -1480,9 +1787,10 @@ def main():
             tab_labels = markets + ['Combined']
         else:
             tab_labels = markets
-        tab_labels.append('📓 Journal')
+        tab_labels.append('📓 Journal (Crypto)')
     if tr_analyzer:
         tab_labels.append('🏦 Trade Republic')
+        tab_labels.append('📒 Journal (TradFi)')
 
     if not tab_labels:
         st.warning("No valid data found."); return
@@ -1529,10 +1837,16 @@ def main():
             render_journal_tab(az.trades)
         tab_idx += 1
 
-    # Trade Republic tab
+    # Trade Republic tab + TradFi journal tab
     if tr_analyzer:
         with tabs[tab_idx]:
             render_tr_tab(tr_analyzer)
+        tab_idx += 1
+
+        with tabs[tab_idx]:
+            st.markdown('<div class="dash-header">📒 Journal (TradFi)</div>', unsafe_allow_html=True)
+            st.caption("Journal entries for Trade Republic / TradFi positions")
+            render_tr_journal_overview()
 
 
 if __name__ == "__main__":
