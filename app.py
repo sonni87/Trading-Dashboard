@@ -90,8 +90,14 @@ class BitgetAnalyzer:
         trade_types_open = {'open_short', 'open_long'}
         trade_types_close = {'close_short', 'close_long'}
 
-        for symbol in self.df['Futures'].unique():
-            symbol_df = self.df[self.df['Futures'] == symbol].sort_values('Date')
+        # Filter out rows without a valid Futures symbol (transfers, deposits, etc.)
+        valid_df = self.df[self.df['Futures'].notna() & (self.df['Futures'].astype(str).str.strip() != '')]
+
+        for symbol in valid_df['Futures'].unique():
+            symbol_df = valid_df[valid_df['Futures'] == symbol].sort_values('Date')
+
+            if symbol_df.empty:
+                continue
 
             # Detect market type for this symbol
             market = symbol_df['Market'].iloc[0] if 'Market' in symbol_df.columns else 'Unknown'
