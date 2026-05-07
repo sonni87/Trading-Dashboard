@@ -303,59 +303,103 @@ class TradeRepublicAnalyzer:
         return 'account_type' in first and 'asset_class' in first
 
     def analyze(self):
-        trading = self.df[self.df['category'] == 'TRADING'].copy()
-        for name in trading['name'].dropna().unique():
-            asset = trading[trading['name'] == name].sort_values('datetime')
-            if asset.empty: continue
-            asset_class = asset['asset_class'].iloc[0]
-            symbol = asset['symbol'].iloc[0] if pd.notna(asset['symbol'].iloc[0]) else ''
-            buys = asset[asset['type'] == 'BUY'].copy()
-            sells = asset[asset['type'] == 'SELL'].copy()
-            total_shares_bought = buys['shares'].sum()
-            total_shares_sold = abs(sells['shares'].sum())
-            total_buy_amount = abs(buys['amount'].sum())
-            total_sell_amount = sells['amount'].sum()
+        # Collect all relevant events per asset name
+        df = self.df
+        trading = df[(df['category'] == 'TRADING') & (df['type'].isin(['BUY', 'SELL']))]
+        exercises = df[(df['category'] == 'CORPORATE_ACTION') & (df['type'] == 'WARRANT_EXERCISE')]
+        tilg = df[(df['category'] == 'CASH') & (df['type'] == 'TILG')]
+        deliveries = df[(df['category'] == 'DELIVERY') & (df['type'].isin(['FREE_DELIVERY', 'CORRECTION']))]
+
+        all_names = set(trading['name'].dropna().unique())
+        for extra in [exercises, tilg, deliveries]:
+            all_names |= set(extra['name'].dropna().unique())
+
+        for name in all_names:
+            buys = trading[(trading['name'] == name) & (trading['type'] == 'BUY')]
+            sells = trading[(trading['name'] == name) & (trading['type'] == 'SELL')]
+            we = exercises[exercises['name'] == name]  # warrant exercise
+            tg = tilg[tilg['name'] == name]  # Tilgung (redemption payout)
+            dl = deliveries[deliveries['name'] == name]  # free delivery / correction
+
+            if buys.empty and sells.empty and we.empty:
+                continue
+
+            # Determine asset class from any available row
+            all_rows = pd.concat([buys, sells, we]).sort_values('datetime') if not we.empty else pd.concat([buys, sells]).sort_values('datetime')
+            if all_rows.empty:
+                continue
+            asset_class = all_rows['asset_class'].dropna().iloc[0] if len(all_rows[all_rows['asset_class'].notna()]) > 0 else ''
+            symbol = all_rows['symbol'].dropna().iloc[0] if len(all_rows[all_rows['symbol'].notna()]) > 0 else ''
+
+            total_bought = buys['shares'].sum()
+            total_buy_cost = abs(buys['amount'].sum())
             buy_fees = abs(buys['fee'].sum())
+
+            total_sold = abs(sells['shares'].sum())
+            sell_proceeds = sells['amount'].sum()
             sell_fees = abs(sells['fee'].sum())
-            taxes = abs(sells['tax'].sum())
+            sell_taxes = abs(sells['tax'].sum())
 
-            if total_shares_sold > 0.0001:
-                # Has sells → compute realized P&L
-                if total_shares_bought > 0.0001:
-                    avg_buy_price = total_buy_amount / total_shares_bought
-                else:
-                    avg_buy_price = 0
-                cost_of_sold = total_shares_sold * avg_buy_price
-                realized_pnl = total_sell_amount - cost_of_sold
-                remaining_shares = total_shares_bought - total_shares_sold
+            # Warrant exercises close positions (shares removed, payout via TILG)
+            exercised_shares = abs(we['shares'].sum())
+            tilg_payout = tg['amount'].sum()  # redemption proceeds
+            tilg_taxes = abs(tg['tax'].sum()) if 'tax' in tg.columns else 0
 
-                first_buy = buys['datetime'].min() if len(buys) > 0 else asset['datetime'].min()
-                last_sell = sells['datetime'].max()
+            # Free deliveries (crypto transfers out)
+            delivered_shares = abs(dl['shares'].sum())
+
+            total_closed_shares = total_sold + exercised_shares + delivered_shares
+            total_proceeds = sell_proceeds + tilg_payout
+
+            if total_bought < 0.0001:
+                continue
+
+            avg_buy_price = total_buy_cost / total_bought
+
+            if total_closed_shares > 0.0001:
+                cost_of_closed = total_closed_shares * avg_buy_price
+                realized_pnl = total_proceeds - cost_of_closed
+                total_fees_paid = buy_fees + sell_fees
+                total_taxes_paid = sell_taxes + tilg_taxes
+
+                first_buy = buys['datetime'].min()
+                # Last close date: max of sell dates, exercise dates, delivery dates
+                close_dates = []
+                if not sells.empty: close_dates.append(sells['datetime'].max())
+                if not we.empty: close_dates.append(we['datetime'].max())
+                if not dl.empty: close_dates.append(dl['datetime'].max())
+                last_close = max(close_dates) if close_dates else first_buy
+
+                close_type = 'SELL'
+                if exercised_shares > total_sold and exercised_shares > delivered_shares:
+                    close_type = 'KNOCKOUT'
+                elif delivered_shares > total_sold:
+                    close_type = 'TRANSFER'
 
                 self.closed_positions.append(dict(
                     name=name, symbol=symbol, asset_class=asset_class,
-                    shares_sold=total_shares_sold, avg_buy_price=avg_buy_price,
-                    avg_sell_price=total_sell_amount / total_shares_sold if total_shares_sold > 0 else 0,
-                    realized_pnl=realized_pnl, fees=buy_fees + sell_fees, taxes=taxes,
-                    net_pnl=realized_pnl - buy_fees - sell_fees - taxes,
-                    first_buy=first_buy, last_sell=last_sell,
-                    num_buys=len(buys), num_sells=len(sells),
+                    shares_sold=total_closed_shares, avg_buy_price=avg_buy_price,
+                    avg_sell_price=total_proceeds / total_closed_shares if total_closed_shares > 0 else 0,
+                    realized_pnl=realized_pnl, fees=total_fees_paid, taxes=total_taxes_paid,
+                    net_pnl=realized_pnl - total_fees_paid - total_taxes_paid,
+                    first_buy=first_buy, last_sell=last_close,
+                    num_buys=len(buys), num_sells=len(sells) + len(we),
+                    close_type=close_type,
                 ))
 
-                if remaining_shares > 0.01:
-                    cost_remaining = remaining_shares * avg_buy_price
+                remaining = total_bought - total_closed_shares
+                if remaining > 0.01:
                     self.open_positions.append(dict(
                         name=name, symbol=symbol, asset_class=asset_class,
-                        shares=remaining_shares, avg_cost=avg_buy_price,
-                        total_cost=cost_remaining, first_buy=first_buy,
+                        shares=remaining, avg_cost=avg_buy_price,
+                        total_cost=remaining * avg_buy_price, first_buy=first_buy,
                     ))
-            elif total_shares_bought > 0.0001:
-                # Only buys, still open
-                avg_buy_price = total_buy_amount / total_shares_bought
+            else:
+                # Only buys, fully open
                 self.open_positions.append(dict(
                     name=name, symbol=symbol, asset_class=asset_class,
-                    shares=total_shares_bought, avg_cost=avg_buy_price,
-                    total_cost=total_buy_amount, first_buy=buys['datetime'].min(),
+                    shares=total_bought, avg_cost=avg_buy_price,
+                    total_cost=total_buy_cost, first_buy=buys['datetime'].min(),
                 ))
 
     def summary(self):
@@ -366,7 +410,8 @@ class TradeRepublicAnalyzer:
         dividends = self.df[self.df['type'] == 'DIVIDEND']['amount'].sum()
         interest = self.df[self.df['type'] == 'INTEREST_PAYMENT']['amount'].sum()
         total_fees = abs(trading['fee'].sum())
-        total_taxes = abs(trading['tax'].sum())
+        tilg_taxes = abs(self.df[(self.df['type'] == 'TILG')]['tax'].sum()) if 'tax' in self.df.columns else 0
+        total_taxes = abs(trading['tax'].sum()) + tilg_taxes
         realized_pnl = sum(p['realized_pnl'] for p in self.closed_positions)
         net_pnl = sum(p['net_pnl'] for p in self.closed_positions)
         open_cost = sum(p['total_cost'] for p in self.open_positions)
@@ -562,6 +607,8 @@ def render_tr_tab(tr: TradeRepublicAnalyzer):
                 'Realized P&L': cp_df['realized_pnl'].round(2), 'Fees': cp_df['fees'].round(2),
                 'Taxes': cp_df['taxes'].round(2), 'Net P&L': cp_df['net_pnl'].round(2),
                 'Result': cp_df['realized_pnl'].apply(lambda x: '✅' if x > 0 else '❌'),
+                'How': cp_df.get('close_type', pd.Series(['SELL']*len(cp_df))).map(
+                    {'SELL': '💰 Sold', 'KNOCKOUT': '💥 KO', 'TRANSFER': '📤 Transfer'}).fillna('💰 Sold'),
             })
             st.caption(f"{len(disp_cp)} closed positions")
             st.dataframe(disp_cp, use_container_width=True, hide_index=True,
